@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# bsm — Byobu Session Manager
+# Save, load, list, and shutdown byobu sessions with named configs.
+
+set -euo pipefail
+
+CONFIG_DIR="$HOME/.config/byobu-sessions"
+mkdir -p "$CONFIG_DIR"
+
+usage() {
+    cat <<'EOF'
+bsm — Byobu Session Manager
+
+Usage:
+  bsm save <name>         Save current byobu session as <name>
+  bsm load <name>         Load a saved session config
+  bsm list                List saved session configs
+  bsm show <name>         Show contents of a saved config
+  bsm shutdown            Gracefully shutdown current byobu session (offers to save first)
+  bsm help                Show this help
+
+Configs are stored as JSON in ~/.config/byobu-sessions/
+EOF
+}
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+_require_byobu() {
+    if ! byobu list-sessions &>/dev/null; then
+        echo "Error: No active byobu session found." >&2
+        exit 1
+    fi
+}
+
+_get_full_command() {
+    local pane_pid="$1"
+    local child_pids
+    child_pids=$(pgrep -P "$pane_pid" 2>/dev/null || true)
+
+    if [ -z "$child_pids" ]; then
+        echo ""
+        return
+    fi
+
+    # Get the command line of the first child (the main running process)
+    local first_child
+    first_child=$(echo "$child_pids" | head -1)
+
+    # Use /proc to get full cmdline, falling back to ps
+    if [ -f "/proc/$first_child/cmdline" ]; then
+        # cmdline uses null bytes as separators
+        tr '\0' ' ' < "/proc/$first_child/cmdline" | sed 's/ $//'
+    else
+        ps -p "$first_child" -o args= 2>/dev/null | sed 's/^ *//'
+    fi
+}
+
+# ── Save ─────────────────────────────────────────────────────────────────────
+
+cmd_save() {
+    local name="${1:?Usage: bsm save <name>}"
+    _require_byobu
+
+    local config_file="$CONFIG_DIR/${name}.json"
+    local session_name
+    session_name=$(byobu list-sessions -F '#{session_name}' | head -1)
+
+    local windows_json="[]"
+
+    while IFS='|' read -r idx wname wpath _ pane_pid; do
+        local cmd
+        cmd=$(_get_full_command "$pane_pid")
+
+        windows_json=$(echo "$windows_json" | jq \
+            --argjson idx "$idx" \
+            --arg name "$wname" \
+            --arg dir "$wpath" \
+            --arg cmd "$cmd" \
+            '. + [{index: $idx, name: $name, directory: $dir, command: $cmd}]')
+    done < <(byobu list-panes -s -F '#{window_index}|#{window_name}|#{pane_current_path}|#{pane_current_command}|#{pane_pid}')
+
+    jq -n \
+        --arg name "$name" \
+        --arg saved_at "$(date -Iseconds)" \
+        --arg session "$session_name" \
+        --argjson windows "$windows_json" \
+        '{name: $name, saved_at: $saved_at, session_name: $session, windows: $windows}' \
+        > "$config_file"
+
+    echo "Saved session as '$name' → $config_file"
+    echo ""
+    cmd_show "$name"
+}
+
+# ── Load ─────────────────────────────────────────────────────────────────────
+
+cmd_load() {
+    local name="${1:?Usage: bsm load <name>}"
+    local config_file="$CONFIG_DIR/${name}.json"
+
+    if [ ! -f "$config_file" ]; then
+        echo "Error: No saved config '$name'. Run 'bsm list' to see available configs." >&2
+        exit 1
+    fi
+
+    # Check if a byobu session already exists
+    if byobu list-sessions &>/dev/null; then
+        read -rp "A byobu session is already running. Kill it and load '$name'? [y/N] " answer
+        if [[ "$answer" =~ ^[Yy]$ ]]; then
+            byobu kill-server 2>/dev/null || true
+            sleep 1
+        else
+            echo "Aborted."
+            exit 0
+        fi
+    fi
+
+    local session
+    session=$(jq -r '.session_name // "main"' "$config_file")
+    local win_count
+    win_count=$(jq '.windows | length' "$config_file")
+
+    if [ "$win_count" -eq 0 ]; then
+        echo "Error: Config '$name' has no windows." >&2
+        exit 1
+    fi
+
+    echo "Loading session '$name' ($win_count windows)..."
+
+    # Create session with the first window
+    local first_name first_dir first_cmd
+    first_name=$(jq -r '.windows[0].name' "$config_file")
+    first_dir=$(jq -r '.windows[0].directory' "$config_file")
+    first_cmd=$(jq -r '.windows[0].command // ""' "$config_file")
+
+    byobu new-session -d -s "$session" -n "$first_name" -c "$first_dir"
+
+    # Kill any extra windows that byobu may have auto-created during session startup
+    local extra_windows
+    extra_windows=$(byobu list-windows -t "$session" -F '#{window_index}' | tail -n +2 || true)
+    for win_idx in $extra_windows; do
+        byobu kill-window -t "${session}:${win_idx}" 2>/dev/null || true
+    done
+
+    if [ -n "$first_cmd" ]; then
+        byobu send-keys -t "${session}:${first_name}" "$first_cmd" Enter
+    fi
+
+    # Create remaining windows
+    for i in $(seq 1 $((win_count - 1))); do
+        local wname wdir wcmd widx
+        wname=$(jq -r ".windows[$i].name" "$config_file")
+        wdir=$(jq -r ".windows[$i].directory" "$config_file")
+        wcmd=$(jq -r ".windows[$i].command // \"\"" "$config_file")
+        widx=$(jq -r ".windows[$i].index" "$config_file")
+
+        byobu new-window -t "${session}:${widx}" -n "$wname" -c "$wdir"
+
+        if [ -n "$wcmd" ]; then
+            byobu send-keys -t "${session}:${wname}" "$wcmd" Enter
+        fi
+    done
+
+    # Select the first window
+    byobu select-window -t "${session}:0"
+
+    echo "Session loaded. Attaching..."
+    byobu attach -t "$session"
+}
+
+# ── List ─────────────────────────────────────────────────────────────────────
+
+cmd_list() {
+    local configs
+    configs=$(find "$CONFIG_DIR" -name '*.json' -type f 2>/dev/null)
+
+    if [ -z "$configs" ]; then
+        echo "No saved sessions. Use 'bsm save <name>' to save one."
+        return
+    fi
+
+    echo "Saved byobu sessions:"
+    echo ""
+    printf "  %-20s %-24s %s\n" "NAME" "SAVED AT" "WINDOWS"
+    printf "  %-20s %-24s %s\n" "────" "────────" "───────"
+
+    for f in "$CONFIG_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        local sname saved_at win_summary
+        sname=$(jq -r '.name' "$f")
+        saved_at=$(jq -r '.saved_at' "$f" | cut -d'+' -f1 | sed 's/T/ /')
+        win_summary=$(jq -r '[.windows[].name] | join(", ")' "$f")
+        printf "  %-20s %-24s %s\n" "$sname" "$saved_at" "$win_summary"
+    done
+}
+
+# ── Show ─────────────────────────────────────────────────────────────────────
+
+cmd_show() {
+    local name="${1:?Usage: bsm show <name>}"
+    local config_file="$CONFIG_DIR/${name}.json"
+
+    if [ ! -f "$config_file" ]; then
+        echo "Error: No saved config '$name'." >&2
+        exit 1
+    fi
+
+    local win_count
+    win_count=$(jq '.windows | length' "$config_file")
+
+    echo "Session: $name ($win_count windows)"
+    echo ""
+    printf "  %-4s %-18s %-45s %s\n" "#" "NAME" "DIRECTORY" "COMMAND"
+    printf "  %-4s %-18s %-45s %s\n" "─" "────" "─────────" "───────"
+
+    jq -r '.windows[] | "\(.index)|\(.name)|\(.directory)|\(.command // "(none)")"' "$config_file" |
+    while IFS='|' read -r idx wname wdir wcmd; do
+        # Shorten home dir for display
+        wdir="${wdir/#$HOME/~}"
+        [ "$wcmd" = "" ] && wcmd="(idle)"
+        printf "  %-4s %-18s %-45s %s\n" "$idx" "$wname" "$wdir" "$wcmd"
+    done
+}
+
+# ── Shutdown ─────────────────────────────────────────────────────────────────
+
+cmd_shutdown() {
+    _require_byobu
+
+    read -rp "Save current session before shutdown? [Y/n] " save_answer
+    if [[ ! "$save_answer" =~ ^[Nn]$ ]]; then
+        read -rp "Save name: " save_name
+        if [ -n "$save_name" ]; then
+            cmd_save "$save_name"
+        fi
+    fi
+
+    echo ""
+    read -rp "Shut down all byobu windows? This will kill all running processes. [y/N] " answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        byobu kill-server
+        echo "Byobu session terminated."
+    else
+        echo "Aborted."
+    fi
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+case "${1:-help}" in
+    save)     shift; cmd_save "$@" ;;
+    load)     shift; cmd_load "$@" ;;
+    list)     shift; cmd_list "$@" ;;
+    show)     shift; cmd_show "$@" ;;
+    shutdown) shift; cmd_shutdown "$@" ;;
+    help|-h|--help) usage ;;
+    *)
+        echo "Unknown command: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+esac
