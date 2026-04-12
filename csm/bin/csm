@@ -6,6 +6,7 @@ set -euo pipefail
 
 CONFIG_DIR="$HOME/.config/chrome-sessions"
 DEBUG_PORT="${CSM_DEBUG_PORT:-9222}"
+USER_DATA_DIR="${CSM_USER_DATA_DIR:-$CONFIG_DIR/profile}"
 # Word-split CSM_CHROME_ARGS into an array (may be empty).
 read -r -a EXTRA_CHROME_ARGS <<< "${CSM_CHROME_ARGS:-}"
 mkdir -p "$CONFIG_DIR"
@@ -50,6 +51,7 @@ Usage:
 Environment:
   CSM_DEBUG_PORT          Chrome remote-debugging port (default: 9222)
   CSM_CHROME_BIN          Chrome binary to use (default: auto-detect)
+  CSM_USER_DATA_DIR       Chrome user-data-dir (default: ~/.config/chrome-sessions/profile)
   CSM_CHROME_ARGS         Extra args appended to the chrome launch command
 
 Configs are stored as JSON in ~/.config/chrome-sessions/
@@ -140,6 +142,7 @@ cmd_start() {
 
     nohup "$chrome_bin" \
         --remote-debugging-port="$DEBUG_PORT" \
+        --user-data-dir="$USER_DATA_DIR" \
         ${EXTRA_CHROME_ARGS[@]+"${EXTRA_CHROME_ARGS[@]}"} \
         >/dev/null 2>&1 &
     disown
@@ -150,13 +153,10 @@ cmd_start() {
         cat >&2 <<EOF
 Warning: Launched chrome but debug port $DEBUG_PORT is not responding.
 
-This usually means another Chrome instance is already running with the same
-user-data-dir — the new flags get forwarded to the existing window and the
-debug port stays disabled.
+This usually means another Chrome instance is already running. The
+debug-port flags get forwarded to the existing window and are ignored.
 
-Fix: close the existing Chrome first, OR run csm with an isolated profile:
-  export CSM_CHROME_ARGS="--user-data-dir=\$HOME/.config/chrome-sessions/profile"
-  csm start
+Fix: close the other Chrome first, then re-run 'csm start'.
 EOF
         exit 1
     fi
@@ -286,6 +286,7 @@ cmd_load() {
     # Launch detached so csm doesn't block the terminal.
     nohup "$chrome_bin" \
         --remote-debugging-port="$DEBUG_PORT" \
+        --user-data-dir="$USER_DATA_DIR" \
         ${EXTRA_CHROME_ARGS[@]+"${EXTRA_CHROME_ARGS[@]}"} \
         "${urls[@]}" \
         >/dev/null 2>&1 &

@@ -81,18 +81,14 @@ Auto-detection order for the Chrome binary: `google-chrome`, `google-chrome-stab
 
 ## Environment variables
 
-| Var                | Purpose                                                 | Default     |
-|--------------------|---------------------------------------------------------|-------------|
-| `CSM_DEBUG_PORT`   | Chrome remote-debugging port                            | `9222`      |
-| `CSM_CHROME_BIN`   | Chrome binary name/path                                 | auto-detect |
-| `CSM_CHROME_ARGS`  | Extra args appended to the `chrome` launch command      | (none)      |
+| Var                  | Purpose                                                 | Default                                |
+|----------------------|---------------------------------------------------------|----------------------------------------|
+| `CSM_DEBUG_PORT`     | Chrome remote-debugging port                            | `9222`                                 |
+| `CSM_CHROME_BIN`     | Chrome binary name/path                                 | auto-detect                            |
+| `CSM_USER_DATA_DIR`  | Chrome user-data-dir for the debug profile              | `~/.config/chrome-sessions/profile`    |
+| `CSM_CHROME_ARGS`    | Extra args appended to the `chrome` launch command      | (none)                                 |
 
-Example — launch under an isolated profile directory so your normal Chrome instance is untouched:
-
-```bash
-export CSM_CHROME_ARGS="--user-data-dir=$HOME/.config/chrome-sessions/profile"
-csm load dev
-```
+`csm` uses a dedicated `--user-data-dir` by default so that the debug-mode Chrome runs as a separate instance from your regular browser. This is required by Chrome 147+ (which won't enable the debug port on the default profile). Your csm bookmarks, extensions, and history are independent of your main Chrome.
 
 ## Where configs live
 
@@ -149,7 +145,7 @@ On load, `csm` launches Chrome with `--remote-debugging-port=<port>` and every s
 - Only URLs are restored. Form state, scroll position, and in-memory SPA routes are lost.
 - Multiple windows collapse into one on load.
 - Tab groups and pinned state are not captured.
-- If Chrome is already running *without* the debug port, `csm start` will detect the failure and suggest an isolated profile via `CSM_CHROME_ARGS="--user-data-dir=..."`. Alternatively, close that instance first and use `csm start` to launch a fresh debug-mode Chrome.
+- `csm` uses a separate `--user-data-dir` so it doesn't conflict with your regular Chrome. This means the csm Chrome has its own bookmarks, extensions, and session history. Override with `CSM_USER_DATA_DIR`.
 
 ## Dependencies
 

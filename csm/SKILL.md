@@ -59,16 +59,18 @@ Use `csm status` to check whether a debug Chrome is already running before attem
 - `csm start`, `csm status`, `csm save`, `csm list`, and `csm show` are non-interactive and safe to run directly.
 - On load, `csm` launches Chrome detached (`nohup ... & disown`) so the terminal isn't blocked. All saved URLs are passed on the command line, which opens them as tabs in a single new window.
 - `pkill -f "remote-debugging-port=$PORT"` is used to stop the existing debug Chrome before relaunching.
+- `csm` uses a dedicated `--user-data-dir` (default `~/.config/chrome-sessions/profile`) so the debug Chrome runs separately from the user's regular browser. Required by Chrome 147+.
 - Tab order is preserved. Window groupings are **not** — all tabs land in one window.
 - Page state (form inputs, scroll position, auth-gated SPA routes) is not preserved — only URLs.
 
 ## Environment variables
 
-| Var                  | Purpose                                                 | Default             |
-|----------------------|---------------------------------------------------------|---------------------|
-| `CSM_DEBUG_PORT`     | Chrome remote-debugging port                            | `9222`              |
-| `CSM_CHROME_BIN`     | Chrome binary name/path                                 | auto-detect         |
-| `CSM_CHROME_ARGS`    | Extra args appended to the `chrome` launch command      | (none)              |
+| Var                  | Purpose                                                 | Default                                |
+|----------------------|---------------------------------------------------------|----------------------------------------|
+| `CSM_DEBUG_PORT`     | Chrome remote-debugging port                            | `9222`                                 |
+| `CSM_CHROME_BIN`     | Chrome binary name/path                                 | auto-detect                            |
+| `CSM_USER_DATA_DIR`  | Chrome user-data-dir for the debug profile              | `~/.config/chrome-sessions/profile`    |
+| `CSM_CHROME_ARGS`    | Extra args appended to the `chrome` launch command      | (none)                                 |
 
 Auto-detect order: `google-chrome`, `google-chrome-stable`, `chromium`, `chromium-browser`, `chrome`, `brave-browser`.
 
