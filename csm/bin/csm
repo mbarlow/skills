@@ -6,6 +6,7 @@ set -euo pipefail
 
 CONFIG_DIR="$HOME/.config/chrome-sessions"
 DEBUG_PORT="${CSM_DEBUG_PORT:-9222}"
+USER_DATA_DIR="${CSM_USER_DATA_DIR:-$CONFIG_DIR/profile}"
 # Word-split CSM_CHROME_ARGS into an array (may be empty).
 read -r -a EXTRA_CHROME_ARGS <<< "${CSM_CHROME_ARGS:-}"
 mkdir -p "$CONFIG_DIR"
@@ -38,6 +39,9 @@ usage() {
 csm — Chrome Session Manager
 
 Usage:
+  csm start               Launch an empty debug-mode Chrome on the debug port
+  csm stop                Stop the running debug-mode Chrome (offers to save first)
+  csm status              Show whether debug Chrome is running + tab count
   csm save <name>         Save current debug-mode Chrome tabs as <name>
   csm load <name>         Launch Chrome in debug mode with tabs from <name>
   csm list                List saved tab configs
@@ -47,6 +51,7 @@ Usage:
 Environment:
   CSM_DEBUG_PORT          Chrome remote-debugging port (default: 9222)
   CSM_CHROME_BIN          Chrome binary to use (default: auto-detect)
+  CSM_USER_DATA_DIR       Chrome user-data-dir (default: ~/.config/chrome-sessions/profile)
   CSM_CHROME_ARGS         Extra args appended to the chrome launch command
 
 Configs are stored as JSON in ~/.config/chrome-sessions/
@@ -81,11 +86,127 @@ _require_debug_chrome() {
         cat >&2 <<EOF
 Error: Chrome debug port $DEBUG_PORT is not responding.
 
-Launch Chrome with remote debugging enabled, e.g.:
-  google-chrome --remote-debugging-port=$DEBUG_PORT
+Start one with:
+  csm start
 
-Then open your tabs and re-run 'csm save <name>'.
+Or launch Chrome manually:
+  google-chrome --remote-debugging-port=$DEBUG_PORT
 EOF
+        exit 1
+    fi
+}
+
+_require_chrome_bin() {
+    local bin
+    bin=$(_find_chrome)
+    if [ -z "$bin" ]; then
+        echo "Error: No Chrome/Chromium binary found on PATH." >&2
+        echo "       Set CSM_CHROME_BIN or install google-chrome / chromium." >&2
+        exit 1
+    fi
+    echo "$bin"
+}
+
+_wait_for_debug_port() {
+    # Poll the debug port until it responds or ~5s elapses. Returns 0 if alive.
+    local waited=0
+    while ! _debug_chrome_alive && [ "$waited" -lt 10 ]; do
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    _debug_chrome_alive
+}
+
+_wait_for_debug_port_dead() {
+    local waited=0
+    while _debug_chrome_alive && [ "$waited" -lt 10 ]; do
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    ! _debug_chrome_alive
+}
+
+# ── Start ────────────────────────────────────────────────────────────────────
+
+cmd_start() {
+    if _debug_chrome_alive; then
+        echo "Debug chrome already running on port $DEBUG_PORT."
+        echo "Endpoint: http://localhost:$DEBUG_PORT"
+        return 0
+    fi
+
+    local chrome_bin
+    chrome_bin=$(_require_chrome_bin)
+
+    echo "Starting $chrome_bin with --remote-debugging-port=$DEBUG_PORT..."
+
+    nohup "$chrome_bin" \
+        --remote-debugging-port="$DEBUG_PORT" \
+        --user-data-dir="$USER_DATA_DIR" \
+        ${EXTRA_CHROME_ARGS[@]+"${EXTRA_CHROME_ARGS[@]}"} \
+        >/dev/null 2>&1 &
+    disown
+
+    if _wait_for_debug_port; then
+        echo "✓ Debug chrome started. Endpoint: http://localhost:$DEBUG_PORT"
+    else
+        cat >&2 <<EOF
+Warning: Launched chrome but debug port $DEBUG_PORT is not responding.
+
+This usually means another Chrome instance is already running. The
+debug-port flags get forwarded to the existing window and are ignored.
+
+Fix: close the other Chrome first, then re-run 'csm start'.
+EOF
+        exit 1
+    fi
+}
+
+# ── Stop ─────────────────────────────────────────────────────────────────────
+
+cmd_stop() {
+    if ! _debug_chrome_alive; then
+        echo "No debug chrome running on port $DEBUG_PORT."
+        return 0
+    fi
+
+    read -rp "Save current session before stopping? [Y/n] " save_answer
+    if [[ ! "$save_answer" =~ ^[Nn]$ ]]; then
+        read -rp "Save name: " save_name
+        if [ -n "$save_name" ]; then
+            cmd_save "$save_name"
+            echo ""
+        fi
+    fi
+
+    read -rp "Kill debug chrome on port $DEBUG_PORT? [y/N] " answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        pkill -f "remote-debugging-port=$DEBUG_PORT" 2>/dev/null || true
+        if _wait_for_debug_port_dead; then
+            echo "Debug chrome stopped."
+        else
+            echo "Warning: debug chrome still responding on port $DEBUG_PORT." >&2
+            exit 1
+        fi
+    else
+        echo "Aborted."
+    fi
+}
+
+# ── Status ───────────────────────────────────────────────────────────────────
+
+cmd_status() {
+    if _debug_chrome_alive; then
+        local browser tab_count
+        browser=$(curl -fsS "http://localhost:$DEBUG_PORT/json/version" | jq -r '.Browser // "unknown"')
+        tab_count=$(curl -fsS "http://localhost:$DEBUG_PORT/json" | jq '[.[] | select(.type == "page")] | length')
+        printf "${C_GREEN}●${C_RESET} debug chrome alive on port ${C_CYAN}%s${C_RESET}\n" "$DEBUG_PORT"
+        printf "  browser:  ${C_DIM}%s${C_RESET}\n" "$browser"
+        printf "  tabs:     ${C_DIM}%s${C_RESET}\n" "$tab_count"
+        printf "  endpoint: ${C_DIM}http://localhost:%s${C_RESET}\n" "$DEBUG_PORT"
+    else
+        printf "${C_YELLOW}○${C_RESET} no debug chrome on port ${C_CYAN}%s${C_RESET}\n" "$DEBUG_PORT"
+        printf "  start one with: ${C_BOLD}csm start${C_RESET}\n"
         exit 1
     fi
 }
@@ -133,12 +254,7 @@ cmd_load() {
     fi
 
     local chrome_bin
-    chrome_bin=$(_find_chrome)
-    if [ -z "$chrome_bin" ]; then
-        echo "Error: No Chrome/Chromium binary found on PATH." >&2
-        echo "       Set CSM_CHROME_BIN or install google-chrome / chromium." >&2
-        exit 1
-    fi
+    chrome_bin=$(_require_chrome_bin)
 
     local tab_count
     tab_count=$(jq '.tabs | length' "$config_file")
@@ -152,12 +268,7 @@ cmd_load() {
         read -rp "A debug Chrome is already running on port $DEBUG_PORT. Kill it and load '$name'? [y/N] " answer
         if [[ "$answer" =~ ^[Yy]$ ]]; then
             pkill -f "remote-debugging-port=$DEBUG_PORT" 2>/dev/null || true
-            # Wait until the port actually stops responding (max ~5s).
-            local waited=0
-            while _debug_chrome_alive && [ "$waited" -lt 10 ]; do
-                sleep 0.5
-                waited=$((waited + 1))
-            done
+            _wait_for_debug_port_dead || true
         else
             echo "Aborted."
             exit 0
@@ -175,6 +286,7 @@ cmd_load() {
     # Launch detached so csm doesn't block the terminal.
     nohup "$chrome_bin" \
         --remote-debugging-port="$DEBUG_PORT" \
+        --user-data-dir="$USER_DATA_DIR" \
         ${EXTRA_CHROME_ARGS[@]+"${EXTRA_CHROME_ARGS[@]}"} \
         "${urls[@]}" \
         >/dev/null 2>&1 &
@@ -277,10 +389,13 @@ cmd_show() {
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 case "${1:-help}" in
-    save) shift; cmd_save "$@" ;;
-    load) shift; cmd_load "$@" ;;
-    list) shift; cmd_list "$@" ;;
-    show) shift; cmd_show "$@" ;;
+    start)  shift; cmd_start  "$@" ;;
+    stop)   shift; cmd_stop   "$@" ;;
+    status) shift; cmd_status "$@" ;;
+    save)   shift; cmd_save   "$@" ;;
+    load)   shift; cmd_load   "$@" ;;
+    list)   shift; cmd_list   "$@" ;;
+    show)   shift; cmd_show   "$@" ;;
     help|-h|--help) usage ;;
     *)
         echo "Unknown command: $1" >&2

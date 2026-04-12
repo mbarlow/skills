@@ -13,6 +13,9 @@ It talks to Chrome via the DevTools JSON endpoint exposed by `--remote-debugging
 ## Commands
 
 ```bash
+csm start             # Launch an empty debug-mode Chrome on the debug port
+csm stop              # Stop the debug-mode Chrome (prompts to save first, then confirms kill)
+csm status            # Show whether debug Chrome is alive + tab count (exit 1 if not)
 csm save <name>       # Save currently open tabs (in debug-mode Chrome) as a named config
 csm load <name>       # Kill any existing debug Chrome (with confirmation) and relaunch with saved tabs
 csm list              # List all saved tab configs with tab count + first-tab title
@@ -36,32 +39,48 @@ Only targets where `type == "page"` are saved — service workers, background pa
 - Chrome/Chromium/Brave must be running with `--remote-debugging-port=9222` (or whatever `CSM_DEBUG_PORT` is set to) **for `csm save` to work**.
 - `curl` and `jq` must be installed.
 
-Typical launch command:
+The easiest way to bring up a debug-mode Chrome is:
+
+```bash
+csm start
+```
+
+Or launch it manually:
 
 ```bash
 google-chrome --remote-debugging-port=9222
 ```
 
+Use `csm status` to check whether a debug Chrome is already running before attempting a save.
+
 ## Behavior notes
 
-- `csm load` is **interactive** — if a debug Chrome is already running on the port, it prompts before killing it. Suggest the user run it themselves with `! csm load <name>`.
-- `csm save`, `csm list`, and `csm show` are non-interactive and safe to run directly.
+- `csm load` and `csm stop` are **interactive** — they prompt before killing Chrome. Suggest the user run them with `! csm load <name>` or `! csm stop`.
+- `csm start`, `csm status`, `csm save`, `csm list`, and `csm show` are non-interactive and safe to run directly.
 - On load, `csm` launches Chrome detached (`nohup ... & disown`) so the terminal isn't blocked. All saved URLs are passed on the command line, which opens them as tabs in a single new window.
 - `pkill -f "remote-debugging-port=$PORT"` is used to stop the existing debug Chrome before relaunching.
+- `csm` uses a dedicated `--user-data-dir` (default `~/.config/chrome-sessions/profile`) so the debug Chrome runs separately from the user's regular browser. Required by Chrome 147+.
 - Tab order is preserved. Window groupings are **not** — all tabs land in one window.
 - Page state (form inputs, scroll position, auth-gated SPA routes) is not preserved — only URLs.
 
 ## Environment variables
 
-| Var                  | Purpose                                                 | Default             |
-|----------------------|---------------------------------------------------------|---------------------|
-| `CSM_DEBUG_PORT`     | Chrome remote-debugging port                            | `9222`              |
-| `CSM_CHROME_BIN`     | Chrome binary name/path                                 | auto-detect         |
-| `CSM_CHROME_ARGS`    | Extra args appended to the `chrome` launch command      | (none)              |
+| Var                  | Purpose                                                 | Default                                |
+|----------------------|---------------------------------------------------------|----------------------------------------|
+| `CSM_DEBUG_PORT`     | Chrome remote-debugging port                            | `9222`                                 |
+| `CSM_CHROME_BIN`     | Chrome binary name/path                                 | auto-detect                            |
+| `CSM_USER_DATA_DIR`  | Chrome user-data-dir for the debug profile              | `~/.config/chrome-sessions/profile`    |
+| `CSM_CHROME_ARGS`    | Extra args appended to the `chrome` launch command      | (none)                                 |
 
 Auto-detect order: `google-chrome`, `google-chrome-stable`, `chromium`, `chromium-browser`, `chrome`, `brave-browser`.
 
 ## Examples
+
+User: "start debug chrome"
+→ `csm start`
+
+User: "is chrome running?"
+→ `csm status`
 
 User: "save my current browser tabs as research"
 → `csm save research`
@@ -74,6 +93,9 @@ User: "show me what's in my dev-tabs session"
 
 User: "load my research tabs"
 → Suggest: `! csm load research` (interactive — needs user to run it)
+
+User: "shut down chrome"
+→ Suggest: `! csm stop` (interactive — needs user to run it)
 
 User: "save my browser as dev but on port 9333"
 → `CSM_DEBUG_PORT=9333 csm save dev`
