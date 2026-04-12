@@ -41,16 +41,22 @@ source ~/git/github.com/mbarlow/skills/csm/aliases.sh
 
 Then reload your shell (`source ~/.bashrc`). You'll get:
 
-| Alias       | Runs         |
-|-------------|--------------|
-| `csm-save`  | `csm save`   |
-| `csm-load`  | `csm load`   |
-| `csm-list`  | `csm list`   |
-| `csm-show`  | `csm show`   |
+| Alias         | Runs           |
+|---------------|----------------|
+| `csm-start`   | `csm start`    |
+| `csm-stop`    | `csm stop`     |
+| `csm-status`  | `csm status`   |
+| `csm-save`    | `csm save`     |
+| `csm-load`    | `csm load`     |
+| `csm-list`    | `csm list`     |
+| `csm-show`    | `csm show`     |
 
 ## Commands
 
 ```bash
+csm start             # Launch an empty debug-mode Chrome on the debug port
+csm stop              # Stop the debug-mode Chrome (offers to save first)
+csm status            # Show whether a debug Chrome is alive + tab count
 csm save <name>       # Save the current debug-mode Chrome tabs as <name>
 csm load <name>       # Kill existing debug Chrome (with confirmation) and relaunch with <name>
 csm list              # List all saved tab configs
@@ -58,20 +64,20 @@ csm show <name>       # Show the tab layout of a saved config
 csm help              # Show usage
 ```
 
-`csm load` is interactive (it prompts before killing an existing debug Chrome). `save`, `list`, and `show` are non-interactive and safe to script.
+`csm load` and `csm stop` are interactive (they prompt before destructive actions). `start`, `status`, `save`, `list`, and `show` are non-interactive and safe to script. `csm status` exits non-zero when no debug Chrome is alive, so it's usable in shell conditionals.
 
-## Prerequisites
-
-Chrome must be running with remote debugging enabled **for `csm save` to work**:
+## Typical workflow
 
 ```bash
-google-chrome --remote-debugging-port=9222
+csm start                 # brings up an empty debug-mode Chrome
+# ... open whatever tabs you want ...
+csm save research         # snapshot them
+csm stop                  # kill the browser when you're done
+# ... later ...
+csm load research         # bring the whole tab set back
 ```
 
-On load, `csm` auto-detects the Chrome binary (in this order):
-`google-chrome`, `google-chrome-stable`, `chromium`, `chromium-browser`, `chrome`, `brave-browser`.
-
-Override with `CSM_CHROME_BIN=/path/to/my-chrome`.
+Auto-detection order for the Chrome binary: `google-chrome`, `google-chrome-stable`, `chromium`, `chromium-browser`, `chrome`, `brave-browser`. Override with `CSM_CHROME_BIN=/path/to/my-chrome`.
 
 ## Environment variables
 
@@ -143,7 +149,7 @@ On load, `csm` launches Chrome with `--remote-debugging-port=<port>` and every s
 - Only URLs are restored. Form state, scroll position, and in-memory SPA routes are lost.
 - Multiple windows collapse into one on load.
 - Tab groups and pinned state are not captured.
-- If Chrome is already running *without* the debug port, `csm save` will fail with a clear error. You'll need to close that instance and relaunch with `--remote-debugging-port=9222` — or use `CSM_CHROME_ARGS="--user-data-dir=..."` to run an isolated profile alongside your normal browser.
+- If Chrome is already running *without* the debug port, `csm start` will detect the failure and suggest an isolated profile via `CSM_CHROME_ARGS="--user-data-dir=..."`. Alternatively, close that instance first and use `csm start` to launch a fresh debug-mode Chrome.
 
 ## Dependencies
 
