@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# csm — Chrome Session Manager
+# Save, load, list, and show Chrome debug-mode tab sessions with named configs.
+
+set -euo pipefail
+
+CONFIG_DIR="$HOME/.config/chrome-sessions"
+DEBUG_PORT="${CSM_DEBUG_PORT:-9222}"
+# Word-split CSM_CHROME_ARGS into an array (may be empty).
+read -r -a EXTRA_CHROME_ARGS <<< "${CSM_CHROME_ARGS:-}"
+mkdir -p "$CONFIG_DIR"
+
+# ── Color setup ──────────────────────────────────────────────────────────────
+# Respect NO_COLOR and disable when stdout isn't a terminal.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_CYAN=$'\033[36m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_RESET=$'\033[0m'
+else
+    C_BOLD='' C_DIM='' C_CYAN='' C_GREEN='' C_YELLOW='' C_RESET=''
+fi
+
+# Print N box-drawing horizontal line characters
+_hr() {
+    local n="$1" out='' i=0
+    while [ "$i" -lt "$n" ]; do
+        out+='─'
+        i=$((i + 1))
+    done
+    printf '%s' "$out"
+}
+
+usage() {
+    cat <<EOF
+csm — Chrome Session Manager
+
+Usage:
+  csm save <name>         Save current debug-mode Chrome tabs as <name>
+  csm load <name>         Launch Chrome in debug mode with tabs from <name>
+  csm list                List saved tab configs
+  csm show <name>         Show contents of a saved config
+  csm help                Show this help
+
+Environment:
+  CSM_DEBUG_PORT          Chrome remote-debugging port (default: 9222)
+  CSM_CHROME_BIN          Chrome binary to use (default: auto-detect)
+  CSM_CHROME_ARGS         Extra args appended to the chrome launch command
+
+Configs are stored as JSON in ~/.config/chrome-sessions/
+EOF
+}
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+_find_chrome() {
+    if [ -n "${CSM_CHROME_BIN:-}" ]; then
+        if command -v "$CSM_CHROME_BIN" >/dev/null 2>&1; then
+            echo "$CSM_CHROME_BIN"
+            return
+        fi
+    fi
+    local bin
+    for bin in google-chrome google-chrome-stable chromium chromium-browser chrome brave-browser; do
+        if command -v "$bin" >/dev/null 2>&1; then
+            echo "$bin"
+            return
+        fi
+    done
+    echo ""
+}
+
+_debug_chrome_alive() {
+    curl -fsS --max-time 2 "http://localhost:$DEBUG_PORT/json/version" >/dev/null 2>&1
+}
+
+_require_debug_chrome() {
+    if ! _debug_chrome_alive; then
+        cat >&2 <<EOF
+Error: Chrome debug port $DEBUG_PORT is not responding.
+
+Launch Chrome with remote debugging enabled, e.g.:
+  google-chrome --remote-debugging-port=$DEBUG_PORT
+
+Then open your tabs and re-run 'csm save <name>'.
+EOF
+        exit 1
+    fi
+}
+
+# ── Save ─────────────────────────────────────────────────────────────────────
+
+cmd_save() {
+    local name="${1:?Usage: csm save <name>}"
+    _require_debug_chrome
+
+    local config_file="$CONFIG_DIR/${name}.json"
+
+    local tabs_json
+    tabs_json=$(curl -fsS "http://localhost:$DEBUG_PORT/json" \
+        | jq '[.[] | select(.type == "page")]
+              | to_entries
+              | map({index: .key, title: .value.title, url: .value.url})')
+
+    local browser
+    browser=$(curl -fsS "http://localhost:$DEBUG_PORT/json/version" | jq -r '.Browser // "unknown"')
+
+    jq -n \
+        --arg name "$name" \
+        --arg saved_at "$(date -Iseconds)" \
+        --arg browser "$browser" \
+        --argjson port "$DEBUG_PORT" \
+        --argjson tabs "$tabs_json" \
+        '{name: $name, saved_at: $saved_at, browser: $browser, debug_port: $port, tabs: $tabs}' \
+        > "$config_file"
+
+    echo "Saved session as '$name' → $config_file"
+    echo ""
+    cmd_show "$name"
+}
+
+# ── Load ─────────────────────────────────────────────────────────────────────
+
+cmd_load() {
+    local name="${1:?Usage: csm load <name>}"
+    local config_file="$CONFIG_DIR/${name}.json"
+
+    if [ ! -f "$config_file" ]; then
+        echo "Error: No saved config '$name'. Run 'csm list' to see available configs." >&2
+        exit 1
+    fi
+
+    local chrome_bin
+    chrome_bin=$(_find_chrome)
+    if [ -z "$chrome_bin" ]; then
+        echo "Error: No Chrome/Chromium binary found on PATH." >&2
+        echo "       Set CSM_CHROME_BIN or install google-chrome / chromium." >&2
+        exit 1
+    fi
+
+    local tab_count
+    tab_count=$(jq '.tabs | length' "$config_file")
+
+    if [ "$tab_count" -eq 0 ]; then
+        echo "Error: Config '$name' has no tabs." >&2
+        exit 1
+    fi
+
+    if _debug_chrome_alive; then
+        read -rp "A debug Chrome is already running on port $DEBUG_PORT. Kill it and load '$name'? [y/N] " answer
+        if [[ "$answer" =~ ^[Yy]$ ]]; then
+            pkill -f "remote-debugging-port=$DEBUG_PORT" 2>/dev/null || true
+            # Wait until the port actually stops responding (max ~5s).
+            local waited=0
+            while _debug_chrome_alive && [ "$waited" -lt 10 ]; do
+                sleep 0.5
+                waited=$((waited + 1))
+            done
+        else
+            echo "Aborted."
+            exit 0
+        fi
+    fi
+
+    local urls=()
+    local url
+    while IFS= read -r url; do
+        [ -n "$url" ] && urls+=("$url")
+    done < <(jq -r '.tabs[].url' "$config_file")
+
+    echo "Loading '$name' ($tab_count tabs) via $chrome_bin..."
+
+    # Launch detached so csm doesn't block the terminal.
+    nohup "$chrome_bin" \
+        --remote-debugging-port="$DEBUG_PORT" \
+        ${EXTRA_CHROME_ARGS[@]+"${EXTRA_CHROME_ARGS[@]}"} \
+        "${urls[@]}" \
+        >/dev/null 2>&1 &
+    disown
+
+    echo "Chrome launched. Debug endpoint: http://localhost:$DEBUG_PORT"
+}
+
+# ── List ─────────────────────────────────────────────────────────────────────
+
+cmd_list() {
+    local configs
+    configs=$(find "$CONFIG_DIR" -name '*.json' -type f 2>/dev/null)
+
+    if [ -z "$configs" ]; then
+        echo "No saved sessions. Use 'csm save <name>' to save one."
+        return
+    fi
+
+    # Collect rows and compute column widths dynamically so data never overflows.
+    local rows=()
+    local w_name=4 w_date=8
+    local f sname saved_at tab_count first_title summary
+    for f in "$CONFIG_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        sname=$(jq -r '.name' "$f")
+        saved_at=$(jq -r '.saved_at | sub("T"; " ") | sub("[+-][0-9]{2}:[0-9]{2}$"; "")' "$f")
+        tab_count=$(jq -r '.tabs | length' "$f")
+        first_title=$(jq -r '.tabs[0].title // "(empty)"' "$f")
+        if [ "${#first_title}" -gt 50 ]; then
+            first_title="${first_title:0:47}..."
+        fi
+        if [ "$tab_count" = "1" ]; then
+            summary="${tab_count} tab — ${first_title}"
+        else
+            summary="${tab_count} tabs — ${first_title}"
+        fi
+        rows+=("${sname}"$'\t'"${saved_at}"$'\t'"${summary}")
+        (( ${#sname}    > w_name )) && w_name=${#sname}
+        (( ${#saved_at} > w_date )) && w_date=${#saved_at}
+    done
+
+    printf "${C_BOLD}Saved chrome sessions:${C_RESET}\n\n"
+    printf "  ${C_CYAN}${C_BOLD}%-*s  %-*s  %s${C_RESET}\n" \
+        "$w_name" "NAME" "$w_date" "SAVED AT" "TABS"
+    printf "  ${C_DIM}%s  %s  %s${C_RESET}\n" \
+        "$(_hr "$w_name")" "$(_hr "$w_date")" "$(_hr 4)"
+
+    local row
+    for row in "${rows[@]}"; do
+        IFS=$'\t' read -r sname saved_at summary <<< "$row"
+        printf "  ${C_BOLD}%-*s${C_RESET}  ${C_DIM}%-*s${C_RESET}  ${C_GREEN}%s${C_RESET}\n" \
+            "$w_name" "$sname" "$w_date" "$saved_at" "$summary"
+    done
+}
+
+# ── Show ─────────────────────────────────────────────────────────────────────
+
+cmd_show() {
+    local name="${1:?Usage: csm show <name>}"
+    local config_file="$CONFIG_DIR/${name}.json"
+
+    if [ ! -f "$config_file" ]; then
+        echo "Error: No saved config '$name'." >&2
+        exit 1
+    fi
+
+    local tab_count browser
+    tab_count=$(jq '.tabs | length' "$config_file")
+    browser=$(jq -r '.browser // "unknown"' "$config_file")
+
+    # Collect rows and compute column widths dynamically.
+    local rows=()
+    local w_idx=1 w_title=5
+    local idx title url
+    while IFS=$'\t' read -r idx title url; do
+        if [ "${#title}" -gt 60 ]; then
+            title="${title:0:57}..."
+        fi
+        rows+=("${idx}"$'\t'"${title}"$'\t'"${url}")
+        (( ${#idx}   > w_idx   )) && w_idx=${#idx}
+        (( ${#title} > w_title )) && w_title=${#title}
+    done < <(jq -r '.tabs[] | [.index, .title, .url] | @tsv' "$config_file")
+
+    printf "${C_BOLD}Session:${C_RESET} ${C_CYAN}%s${C_RESET} ${C_DIM}(%s tabs — %s)${C_RESET}\n\n" \
+        "$name" "$tab_count" "$browser"
+    printf "  ${C_CYAN}${C_BOLD}%-*s  %-*s  %s${C_RESET}\n" \
+        "$w_idx" "#" "$w_title" "TITLE" "URL"
+    printf "  ${C_DIM}%s  %s  %s${C_RESET}\n" \
+        "$(_hr "$w_idx")" "$(_hr "$w_title")" "$(_hr 3)"
+
+    local row
+    for row in "${rows[@]}"; do
+        IFS=$'\t' read -r idx title url <<< "$row"
+        printf "  ${C_YELLOW}%-*s${C_RESET}  ${C_BOLD}%-*s${C_RESET}  ${C_GREEN}%s${C_RESET}\n" \
+            "$w_idx" "$idx" "$w_title" "$title" "$url"
+    done
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+case "${1:-help}" in
+    save) shift; cmd_save "$@" ;;
+    load) shift; cmd_load "$@" ;;
+    list) shift; cmd_list "$@" ;;
+    show) shift; cmd_show "$@" ;;
+    help|-h|--help) usage ;;
+    *)
+        echo "Unknown command: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+esac
