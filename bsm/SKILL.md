@@ -1,6 +1,6 @@
 ---
 name: bsm
-description: Manage and restore byobu screen session configurations — save, load, list, show, and shutdown sessions
+description: Manage and restore byobu screen session configurations — save, load, list, show, delete, and shutdown sessions
 user_invocable: true
 ---
 
@@ -15,6 +15,7 @@ bsm save <name>       # Save current byobu session layout as named config
 bsm load <name>       # Kill existing session (with confirmation) and restore a saved one
 bsm list              # List all saved session configs with window summaries
 bsm show <name>       # Show detailed window layout of a saved config
+bsm delete <name>     # Delete a saved config (prompts; -f to skip confirmation)
 bsm shutdown          # Gracefully shutdown byobu (offers to save first)
 ```
 
@@ -29,6 +30,7 @@ Each config is a JSON file (`~/.config/byobu-sessions/<name>.json`) containing:
 
 - `bsm load` is interactive — it prompts before killing an existing session, so suggest the user run it themselves with `! bsm load <name>`
 - `bsm shutdown` is also interactive — prompts to save and confirm
+- `bsm delete` prompts for confirmation by default; pass `-f` to skip the prompt (safe to run non-interactively with `-f`)
 - `bsm save`, `bsm list`, and `bsm show` are non-interactive and safe to run directly
 - Saved commands are captured from child processes of each pane via `/proc/<pid>/cmdline`
 - On load, windows are created with `byobu new-window` and commands are sent via `send-keys`
@@ -46,6 +48,12 @@ User: "show me what's in my dev session"
 
 User: "load my dev session"
 → Suggest: `! bsm load dev` (interactive — needs user to run it)
+
+User: "delete my old dev session"
+→ Suggest: `! bsm delete dev` (prompts), or run `bsm delete dev -f` if user has confirmed
+
+User: "forget all my saved sessions"
+→ Confirm with user first, then `bsm delete <name> -f` per entry from `bsm list`
 
 User: "shut down byobu"
 → Suggest: `! bsm shutdown` (interactive — needs user to run it)

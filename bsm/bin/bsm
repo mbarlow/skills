@@ -39,6 +39,7 @@ Usage:
   bsm load <name>         Load a saved session config
   bsm list                List saved session configs
   bsm show <name>         Show contents of a saved config
+  bsm delete <name>       Delete a saved session config (use -f to skip confirmation)
   bsm shutdown            Gracefully shutdown current byobu session (offers to save first)
   bsm help                Show this help
 
@@ -272,6 +273,40 @@ cmd_show() {
     done
 }
 
+# ── Delete ───────────────────────────────────────────────────────────────────
+
+cmd_delete() {
+    local force=0
+    local name=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f|--force) force=1 ;;
+            -*) echo "Unknown flag: $1" >&2; exit 1 ;;
+            *) name="$1" ;;
+        esac
+        shift
+    done
+
+    [ -n "$name" ] || { echo "Usage: bsm delete <name> [-f]" >&2; exit 1; }
+
+    local config_file="$CONFIG_DIR/${name}.json"
+    if [ ! -f "$config_file" ]; then
+        echo "Error: No saved config '$name'. Run 'bsm list' to see available configs." >&2
+        exit 1
+    fi
+
+    if [ "$force" -ne 1 ]; then
+        read -rp "Delete saved session '$name'? [y/N] " answer
+        if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+            echo "Aborted."
+            exit 0
+        fi
+    fi
+
+    rm -f "$config_file"
+    echo "Deleted '$name' → $config_file"
+}
+
 # ── Shutdown ─────────────────────────────────────────────────────────────────
 
 cmd_shutdown() {
@@ -302,6 +337,7 @@ case "${1:-help}" in
     load)     shift; cmd_load "$@" ;;
     list)     shift; cmd_list "$@" ;;
     show)     shift; cmd_show "$@" ;;
+    delete|rm) shift; cmd_delete "$@" ;;
     shutdown) shift; cmd_shutdown "$@" ;;
     help|-h|--help) usage ;;
     *)

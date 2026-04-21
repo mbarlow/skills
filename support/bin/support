@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+# support — incident-report CLI for mbarlow/support
+#
+# Creates, lists, and updates incident skeletons. Never talks to the network.
+# Issue creation in mbarlow/tasks is handled by the /issues Claude Code skill,
+# not this script.
+
+set -euo pipefail
+
+SUPPORT_REPO="${SUPPORT_REPO:-$HOME/git/github.com/mbarlow/support}"
+INCIDENTS_DIR="$SUPPORT_REPO/incidents"
+SCHEMA_FILE="$SUPPORT_REPO/schema/incident.schema.json"
+TPL_MD="$SUPPORT_REPO/templates/incident.template.md"
+TPL_JSON="$SUPPORT_REPO/templates/incident.template.json"
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+die() { echo "support: $*" >&2; exit 1; }
+
+require_repo() {
+    [ -d "$SUPPORT_REPO" ] || die "SUPPORT_REPO not found: $SUPPORT_REPO"
+    [ -f "$TPL_MD" ]       || die "template missing: $TPL_MD"
+    [ -f "$TPL_JSON" ]     || die "template missing: $TPL_JSON"
+}
+
+slugify() {
+    # lowercase, strip non-alnum to dashes, trim dashes, cap at 40 chars
+    echo "$1" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' \
+        | cut -c1-40 \
+        | sed -E 's/-+$//'
+}
+
+iso_now() { date --iso-8601=seconds; }
+
+detect_host_os()       { . /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-$(uname -s)}" || uname -s; }
+detect_host_kernel()   { uname -r; }
+detect_host_arch()     { uname -m; }
+detect_host_gpu()      {
+    if command -v lspci >/dev/null 2>&1; then
+        lspci 2>/dev/null | grep -iE 'vga|3d|display' | head -1 | sed -E 's/^[^:]+: //' || echo ""
+    fi
+}
+detect_host_session()  { echo "${XDG_SESSION_TYPE:-unknown}"; }
+
+json_escape() {
+    # escape a string for embedding in JSON (via jq for correctness)
+    jq -Rn --arg s "$1" '$s'
+}
+
+# Find an incident folder given a slug or full folder name.
+# Echoes absolute path, or nothing.
+resolve_incident() {
+    local key="$1"
+    [ -z "$key" ] && return 1
+    # Exact folder match?
+    if [ -d "$INCIDENTS_DIR/$key" ]; then
+        echo "$INCIDENTS_DIR/$key"; return 0
+    fi
+    # Suffix match (slug without date prefix) — expect exactly one hit
+    local matches
+    matches=$(find "$INCIDENTS_DIR" -mindepth 1 -maxdepth 1 -type d -name "*-$key" 2>/dev/null || true)
+    local count
+    count=$(printf '%s\n' "$matches" | grep -c . || true)
+    if [ "$count" -eq 1 ]; then
+        printf '%s' "$matches"
+        return 0
+    elif [ "$count" -gt 1 ]; then
+        echo "support: ambiguous slug '$key' — matches:" >&2
+        printf '  %s\n' $matches >&2
+        return 1
+    fi
+    return 1
+}
+
+# ── subcommands ──────────────────────────────────────────────────────────────
+
+cmd_help() {
+    cat <<'EOF'
+support — incident-report CLI for mbarlow/support
+
+USAGE
+  support new    [--slug NAME] [--title "..."] [--severity LVL] [--category CAT]
+                 [--date YYYY-MM-DD] [--no-issue]
+  support list   [--status STATUS] [--severity SEV] [--category CAT]
+  support show   <slug>
+  support path   <slug>
+  support status <slug> <new-status>
+  support link   <slug> --task URL
+  support link   <slug> --upstream REPO --url URL --type issue|pr [--notes "..."]
+  support validate [<slug>]
+  support help
+
+SEVERITY   low | medium | high | critical
+CATEGORY   wm | boot | gpu | network | app | security | hardware | other
+STATUS     draft | investigating | triaged | resolved | wontfix | deferred
+
+ENV
+  SUPPORT_REPO   default: ~/git/github.com/mbarlow/support
+
+EXAMPLES
+  support new --title "hyprlock crashed" --severity high --category wm
+  support list --severity high
+  support status hyprlock-crash triaged
+  support link hyprlock-crash --upstream hyprwm/Hyprland \
+    --url https://github.com/hyprwm/Hyprland/issues/12345 --type issue
+
+Issue creation in mbarlow/tasks is handled by the /issues Claude Code skill
+(invoked automatically by the /support skill), not by this CLI.
+EOF
+}
+
+cmd_new() {
+    require_repo
+    local slug="" title="" severity="medium" category="other" date no_issue=0
+    date="$(date +%F)"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --slug)      slug="$2"; shift 2 ;;
+            --title)     title="$2"; shift 2 ;;
+            --severity)  severity="$2"; shift 2 ;;
+            --category)  category="$2"; shift 2 ;;
+            --date)      date="$2"; shift 2 ;;
+            --no-issue)  no_issue=1; shift ;;
+            -h|--help)   cmd_help; return 0 ;;
+            *)           die "new: unknown arg: $1" ;;
+        esac
+    done
+
+    [ -n "$title" ] || die "new: --title is required"
+    case "$severity" in low|medium|high|critical) ;; *) die "new: invalid severity '$severity'";; esac
+    case "$category" in wm|boot|gpu|network|app|security|hardware|other) ;; *) die "new: invalid category '$category'";; esac
+    [[ "$date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die "new: --date must be YYYY-MM-DD"
+
+    [ -n "$slug" ] || slug="$(slugify "$title")"
+    slug="$(slugify "$slug")"
+    [ -n "$slug" ] || die "new: could not derive a non-empty slug"
+
+    local folder="$INCIDENTS_DIR/${date}-${slug}"
+    [ -e "$folder" ] && die "new: folder already exists: $folder"
+
+    mkdir -p "$folder"
+
+    local created_at host_os host_kernel host_arch host_gpu host_session
+    created_at="$(iso_now)"
+    host_os="$(detect_host_os)"
+    host_kernel="$(detect_host_kernel)"
+    host_arch="$(detect_host_arch)"
+    host_gpu="$(detect_host_gpu)"
+    host_session="$(detect_host_session)"
+
+    # Render templates via jq for JSON and sed for md. We use jq --arg so values
+    # with special characters are safely escaped.
+    jq \
+        --arg id          "$slug" \
+        --arg title       "$title" \
+        --arg created_at  "$created_at" \
+        --arg severity    "$severity" \
+        --arg category    "$category" \
+        --arg host_os     "$host_os" \
+        --arg host_kernel "$host_kernel" \
+        --arg host_arch   "$host_arch" \
+        --arg host_gpu    "$host_gpu" \
+        --arg host_session "$host_session" \
+        '
+        .id = $id
+        | .title = $title
+        | .created_at = $created_at
+        | .updated_at = $created_at
+        | .severity = $severity
+        | .category = $category
+        | .host.os = $host_os
+        | .host.kernel = $host_kernel
+        | .host.arch = $host_arch
+        | .host.gpu = $host_gpu
+        | .host.session_type = $host_session
+        ' "$TPL_JSON" > "$folder/incident.json"
+
+    # Markdown: plain sed-based placeholder substitution. Escape replacement chars.
+    _sed_escape() { printf '%s' "$1" | sed -e 's/[\/&]/\\&/g'; }
+    sed \
+        -e "s/{{id}}/$(_sed_escape "$slug")/g" \
+        -e "s/{{title}}/$(_sed_escape "$title")/g" \
+        -e "s/{{created_at}}/$(_sed_escape "$created_at")/g" \
+        -e "s/{{severity}}/$(_sed_escape "$severity")/g" \
+        -e "s/{{category}}/$(_sed_escape "$category")/g" \
+        -e "s/{{host_os}}/$(_sed_escape "$host_os")/g" \
+        -e "s/{{host_kernel}}/$(_sed_escape "$host_kernel")/g" \
+        -e "s/{{host_arch}}/$(_sed_escape "$host_arch")/g" \
+        -e "s/{{host_gpu}}/$(_sed_escape "$host_gpu")/g" \
+        -e "s/{{host_session}}/$(_sed_escape "$host_session")/g" \
+        "$TPL_MD" > "$folder/incident.md"
+
+    echo "created: $folder"
+    echo "  incident.md   → $folder/incident.md"
+    echo "  incident.json → $folder/incident.json"
+    if [ "$no_issue" -eq 0 ]; then
+        echo ""
+        echo "next: Claude should now investigate (read-only), fill in the report,"
+        echo "      and run /issues create to file a review ticket in mbarlow/tasks."
+    fi
+}
+
+cmd_list() {
+    require_repo
+    local f_status="" f_severity="" f_category=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --status)    f_status="$2"; shift 2 ;;
+            --severity)  f_severity="$2"; shift 2 ;;
+            --category)  f_category="$2"; shift 2 ;;
+            -h|--help)   cmd_help; return 0 ;;
+            *)           die "list: unknown arg: $1" ;;
+        esac
+    done
+
+    [ -d "$INCIDENTS_DIR" ] || { echo "(no incidents yet)"; return 0; }
+
+    local rows=()
+    local folder json
+    while IFS= read -r folder; do
+        json="$folder/incident.json"
+        [ -f "$json" ] || continue
+
+        local status severity category id title
+        status=$(jq -r '.status // ""'   "$json")
+        severity=$(jq -r '.severity // ""' "$json")
+        category=$(jq -r '.category // ""' "$json")
+        id=$(jq -r '.id // ""'           "$json")
+        title=$(jq -r '.title // ""'     "$json")
+
+        [ -n "$f_status"   ] && [ "$status"   != "$f_status"   ] && continue
+        [ -n "$f_severity" ] && [ "$severity" != "$f_severity" ] && continue
+        [ -n "$f_category" ] && [ "$category" != "$f_category" ] && continue
+
+        local folder_name
+        folder_name="$(basename "$folder")"
+        rows+=("$(printf '%s\t%s\t%s\t%s\t%s' \
+            "$folder_name" "$status" "$severity" "$category" "$title")")
+    done < <(find "$INCIDENTS_DIR" -mindepth 1 -maxdepth 1 -type d | sort)
+
+    if [ "${#rows[@]}" -eq 0 ]; then
+        echo "(no incidents match)"; return 0
+    fi
+
+    {
+        printf 'FOLDER\tSTATUS\tSEVERITY\tCATEGORY\tTITLE\n'
+        printf '%s\n' "${rows[@]}"
+    } | column -t -s $'\t'
+}
+
+cmd_show() {
+    require_repo
+    local key="${1:-}"
+    [ -n "$key" ] || die "show: missing <slug>"
+    local folder
+    folder="$(resolve_incident "$key")" || die "show: no incident matches '$key'"
+    echo "$folder"
+    echo ""
+    jq . "$folder/incident.json"
+    echo ""
+    echo "markdown: $folder/incident.md"
+}
+
+cmd_path() {
+    require_repo
+    local key="${1:-}"
+    [ -n "$key" ] || die "path: missing <slug>"
+    local folder
+    folder="$(resolve_incident "$key")" || die "path: no incident matches '$key'"
+    echo "$folder"
+}
+
+cmd_status() {
+    require_repo
+    local key="${1:-}" new="${2:-}"
+    [ -n "$key" ] && [ -n "$new" ] || die "status: usage: support status <slug> <new-status>"
+    case "$new" in draft|investigating|triaged|resolved|wontfix|deferred) ;; *) die "status: invalid '$new'";; esac
+
+    local folder json
+    folder="$(resolve_incident "$key")" || die "status: no incident matches '$key'"
+    json="$folder/incident.json"
+
+    local now tmp
+    now="$(iso_now)"
+    tmp="$(mktemp)"
+    jq --arg s "$new" --arg at "$now" '.status = $s | .updated_at = $at' "$json" > "$tmp"
+    mv "$tmp" "$json"
+    echo "updated: $(basename "$folder") → status=$new"
+}
+
+cmd_link() {
+    require_repo
+    local key="${1:-}"; shift || true
+    [ -n "$key" ] || die "link: missing <slug>"
+
+    local task="" upstream="" url="" type="" notes=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --task)     task="$2"; shift 2 ;;
+            --upstream) upstream="$2"; shift 2 ;;
+            --url)      url="$2"; shift 2 ;;
+            --type)     type="$2"; shift 2 ;;
+            --notes)    notes="$2"; shift 2 ;;
+            -h|--help)  cmd_help; return 0 ;;
+            *)          die "link: unknown arg: $1" ;;
+        esac
+    done
+
+    local folder json now tmp
+    folder="$(resolve_incident "$key")" || die "link: no incident matches '$key'"
+    json="$folder/incident.json"
+    now="$(iso_now)"
+    tmp="$(mktemp)"
+
+    if [ -n "$task" ]; then
+        jq --arg u "$task" --arg at "$now" \
+            '.tracking.tasks_issue = $u | .updated_at = $at' "$json" > "$tmp"
+        mv "$tmp" "$json"
+        echo "linked tasks issue: $task"
+        return 0
+    fi
+
+    if [ -n "$upstream" ]; then
+        [ -n "$url"  ] || die "link: --url is required with --upstream"
+        [ -n "$type" ] || die "link: --type is required with --upstream"
+        case "$type" in issue|pr|discussion) ;; *) die "link: invalid --type '$type'";; esac
+
+        jq \
+            --arg repo "$upstream" \
+            --arg url "$url" \
+            --arg type "$type" \
+            --arg notes "$notes" \
+            --arg at "$now" \
+            '
+            .upstream = ((.upstream // []) + [{
+                repo: $repo,
+                url: $url,
+                type: $type,
+                state: "planned",
+                notes: (if $notes == "" then null else $notes end)
+            } | with_entries(select(.value != null))])
+            | .updated_at = $at
+            ' "$json" > "$tmp"
+        mv "$tmp" "$json"
+        echo "linked upstream: $upstream ($type) → $url"
+        return 0
+    fi
+
+    die "link: nothing to link — pass --task URL or --upstream REPO --url URL --type TYPE"
+}
+
+cmd_validate() {
+    require_repo
+    local key="${1:-}"
+    local targets=()
+
+    if [ -n "$key" ]; then
+        local folder
+        folder="$(resolve_incident "$key")" || die "validate: no incident matches '$key'"
+        targets=("$folder/incident.json")
+    else
+        while IFS= read -r f; do targets+=("$f"); done < <(find "$INCIDENTS_DIR" -type f -name incident.json 2>/dev/null | sort)
+    fi
+
+    [ "${#targets[@]}" -gt 0 ] || { echo "(no incidents to validate)"; return 0; }
+
+    local ok=1
+    local have_checker=0
+    if command -v check-jsonschema >/dev/null 2>&1; then have_checker=1; fi
+
+    for f in "${targets[@]}"; do
+        if ! jq -e . "$f" >/dev/null 2>&1; then
+            echo "FAIL (invalid JSON): $f"; ok=0; continue
+        fi
+        if [ "$have_checker" -eq 1 ]; then
+            if check-jsonschema --schemafile "$SCHEMA_FILE" "$f" >/dev/null 2>&1; then
+                echo "OK: $f"
+            else
+                echo "FAIL (schema): $f"
+                check-jsonschema --schemafile "$SCHEMA_FILE" "$f" || true
+                ok=0
+            fi
+        else
+            # structural check: required fields present
+            local missing
+            missing=$(jq -r '
+                ["id","title","created_at","status","severity","doc"]
+                - (. | keys)
+                | if length == 0 then empty else (. | join(",")) end
+            ' "$f")
+            if [ -z "$missing" ]; then
+                echo "OK (structural): $f"
+            else
+                echo "FAIL (missing: $missing): $f"; ok=0
+            fi
+        fi
+    done
+
+    [ "$ok" -eq 1 ] || exit 1
+}
+
+# ── dispatcher ───────────────────────────────────────────────────────────────
+
+command -v jq >/dev/null 2>&1 || die "missing dependency: jq"
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+    new)      cmd_new "$@" ;;
+    list)     cmd_list "$@" ;;
+    show)     cmd_show "$@" ;;
+    path)     cmd_path "$@" ;;
+    status)   cmd_status "$@" ;;
+    link)     cmd_link "$@" ;;
+    validate) cmd_validate "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *)        die "unknown command: $cmd (try: support help)" ;;
+esac
