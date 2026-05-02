@@ -8,9 +8,9 @@ It also ships a Claude Code skill definition (`SKILL.md`) so Claude can help you
 
 ## How it works
 
-1. You launch Chrome with `--remote-debugging-port=9222`.
-2. `csm save <name>` curls `http://localhost:9222/json`, filters to `type == "page"`, and writes the tab list to `~/.config/chrome-sessions/<name>.json`.
-3. `csm load <name>` optionally kills the running debug Chrome, then relaunches it with every saved URL on the command line (one tab per URL, all in a single window).
+1. `csm load <name>` (or `csm start <name>`) launches Chrome under `<name>` with its own `--user-data-dir` and an auto-allocated `--remote-debugging-port` (starting at 9222 and walking up). The pid + port are written to `~/.config/chrome-sessions/state/<name>.json`.
+2. `csm save <name>` curls that session's debug port, filters to `type == "page"`, and writes the tab list to `~/.config/chrome-sessions/<name>.json`.
+3. Multiple named sessions can run in parallel — each gets its own profile dir and port.
 
 Only URLs are restored — not form inputs, scroll position, or auth-gated SPA routes.
 
@@ -54,41 +54,66 @@ Then reload your shell (`source ~/.bashrc`). You'll get:
 ## Commands
 
 ```bash
-csm start             # Launch an empty debug-mode Chrome on the debug port
-csm stop              # Stop the debug-mode Chrome (offers to save first)
-csm status            # Show whether a debug Chrome is alive + tab count
-csm save <name>       # Save the current debug-mode Chrome tabs as <name>
-csm load <name>       # Kill existing debug Chrome (with confirmation) and relaunch with <name>
-csm list              # List all saved tab configs
-csm show <name>       # Show the tab layout of a saved config
-csm help              # Show usage
+csm start <name>            # Launch an empty debug Chrome under <name>
+csm stop [name|all] [-q]    # Stop a debug Chrome (default: only-running, current
+                            # if exactly one). "all" stops every running. -q skips prompts.
+csm status [name]           # List all running sessions; or show details for <name>.
+csm save [name]             # Save tabs from a running session.
+                            # No name → only-running; multiple running → picker.
+csm load <name>             # Launch Chrome under <name> with saved tabs.
+                            # Prompts attach / reload / cancel if already running.
+csm list                    # List saved configs with live status + tab titles.
+csm show <name>             # Show every tab in a saved config.
+csm help                    # Show usage.
 ```
 
-`csm load` and `csm stop` are interactive (they prompt before destructive actions). `start`, `status`, `save`, `list`, and `show` are non-interactive and safe to script. `csm status` exits non-zero when no debug Chrome is alive, so it's usable in shell conditionals.
+`csm load` and `csm stop` (without `-q`) are interactive. `start`, `status`, `save`, `list`, and `show` are non-interactive and safe to script. `csm status [name]` exits non-zero when nothing matches, so it's usable in shell conditionals.
+
+## Multi-session model
+
+Each named session gets:
+
+- A user-data-dir at `~/.config/chrome-sessions/profiles/<name>/`
+- An auto-allocated debug port (first free port from `CSM_BASE_PORT`, default 9222)
+- A state file at `~/.config/chrome-sessions/state/<name>.json` recording pid + port
+- A tab config at `~/.config/chrome-sessions/<name>.json` (written by `csm save`)
+
+`csm load dev` and `csm load samdin` run side by side — independent windows, independent extensions, independent profile state.
+
+## `csm list` STATUS column
+
+- `● live` — a session by this name is running (state file exists and the port responds)
+- blank — saved config, nothing running
 
 ## Typical workflow
 
 ```bash
-csm start                 # brings up an empty debug-mode Chrome
+csm start dev             # brings up an empty debug Chrome under "dev"
 # ... open whatever tabs you want ...
-csm save research         # snapshot them
-csm stop                  # kill the browser when you're done
+csm save dev              # snapshot them
+csm stop dev              # kill that browser
 # ... later ...
-csm load research         # bring the whole tab set back
+csm load dev              # bring the dev tab set back
+csm load samdin           # also bring up samdin's tab set, in parallel
+csm list                  # both show ● live
 ```
 
 Auto-detection order for the Chrome binary: `google-chrome`, `google-chrome-stable`, `chromium`, `chromium-browser`, `chrome`, `brave-browser`. Override with `CSM_CHROME_BIN=/path/to/my-chrome`.
 
+## bsm coupling
+
+When [`bsm`](../bsm/) runs `load` / `save` / `shutdown` for a name, csm's matching session follows automatically — no extra command. Pass `--no-csm` to bsm to opt out per-call.
+
 ## Environment variables
 
-| Var                  | Purpose                                                 | Default                                |
-|----------------------|---------------------------------------------------------|----------------------------------------|
-| `CSM_DEBUG_PORT`     | Chrome remote-debugging port                            | `9222`                                 |
-| `CSM_CHROME_BIN`     | Chrome binary name/path                                 | auto-detect                            |
-| `CSM_USER_DATA_DIR`  | Chrome user-data-dir for the debug profile              | `~/.config/chrome-sessions/profile`    |
-| `CSM_CHROME_ARGS`    | Extra args appended to the `chrome` launch command      | (none)                                 |
+| Var                | Purpose                                              | Default       |
+|--------------------|------------------------------------------------------|---------------|
+| `CSM_BASE_PORT`    | Base port for debug-port allocation                  | `9222`        |
+| `CSM_DEBUG_PORT`   | Legacy alias for `CSM_BASE_PORT`                     | `9222`        |
+| `CSM_CHROME_BIN`   | Chrome binary name/path                              | auto-detect   |
+| `CSM_CHROME_ARGS`  | Extra args appended to every chrome launch command   | (none)        |
 
-`csm` uses a dedicated `--user-data-dir` by default so that the debug-mode Chrome runs as a separate instance from your regular browser. This is required by Chrome 147+ (which won't enable the debug port on the default profile). Your csm bookmarks, extensions, and history are independent of your main Chrome.
+`csm` uses dedicated `--user-data-dir`s so debug-mode Chromes run as separate instances from your regular browser. This is required by Chrome 147+ (which won't enable the debug port on the default profile). Each csm session has its own bookmarks, extensions, and history.
 
 ## Where configs live
 
@@ -145,7 +170,7 @@ On load, `csm` launches Chrome with `--remote-debugging-port=<port>` and every s
 - Only URLs are restored. Form state, scroll position, and in-memory SPA routes are lost.
 - Multiple windows collapse into one on load.
 - Tab groups and pinned state are not captured.
-- `csm` uses a separate `--user-data-dir` so it doesn't conflict with your regular Chrome. This means the csm Chrome has its own bookmarks, extensions, and session history. Override with `CSM_USER_DATA_DIR`.
+- Each named session has its own `--user-data-dir`, separate from your regular Chrome and from other csm sessions.
 
 ## Dependencies
 
@@ -178,6 +203,3 @@ csm/
 └── install.sh      # Idempotent symlink installer
 ```
 
-## Roadmap
-
-- Optional `bsm` integration: hook `bsm save`/`bsm load` so a byobu session can carry an associated `csm` session name, restoring both terminals and browser tabs in one command.

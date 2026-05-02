@@ -42,16 +42,16 @@ Then reload your shell (`source ~/.bashrc`). You'll get:
 ## Commands
 
 ```bash
-bsm save [name]          # Save current byobu session as <name>
-                         # (no arg: defaults to the current session name when inside tmux)
-bsm load <name>          # Load a saved config as a tmux session named <name>.
-                         # Runs alongside other live sessions; prompts if <name> already exists.
-bsm list                 # List saved configs with live/drift status
-bsm show <name>          # Show the window layout of a saved config
-bsm delete <name>        # Delete a saved config (use -f to skip confirmation)
-bsm shutdown [name|all]  # Shut down a session (default: current when inside tmux,
-                         # else picker). Use "all" to kill the entire byobu server.
-bsm help                 # Show usage
+bsm save [--no-csm] [name]          # Save current byobu session as <name>
+                                    # (no arg: defaults to the current session name when inside tmux)
+bsm load [--no-csm] <name>          # Load a saved config as a tmux session named <name>.
+                                    # Runs alongside other live sessions; prompts on collision.
+bsm list                            # List saved configs with live/drift status
+bsm show <name>                     # Show the window layout of a saved config
+bsm delete <name>                   # Delete a saved config (use -f to skip confirmation)
+bsm shutdown [--no-csm] [name|all]  # Shut down a session (default: current when inside tmux,
+                                    # else picker). Use "all" to kill the entire byobu server.
+bsm help                            # Show usage
 ```
 
 `bsm load` and `bsm shutdown` are interactive (they prompt before destructive actions). `save`, `list`, `show`, and `delete -f` are safe to script.
@@ -67,6 +67,16 @@ The config name and live session name are coupled by convention — that's how `
 - blank — not loaded
 
 `bsm shutdown` kills a single session by default; pass `all` to kill the whole server.
+
+## csm coupling
+
+When [`csm`](../csm/) is installed on PATH, bsm pairs with it by name:
+
+- `bsm load <name>` also runs `csm load <name>` if a csm config `<name>` exists and no csm instance is running.
+- `bsm save <name>` also runs `csm save <name>` if a csm instance for `<name>` is running.
+- `bsm shutdown <name>` also runs `csm stop <name>` if a csm instance is running. `bsm shutdown all` runs `csm stop all`.
+
+Pass `--no-csm` to any bsm command to skip the coupling for that call.
 
 ## Where configs live
 

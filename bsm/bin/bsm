@@ -35,16 +35,19 @@ usage() {
 bsm — Byobu Session Manager
 
 Usage:
-  bsm save [name]         Save current byobu session as <name>
-                          (no arg: defaults to current session name when inside tmux)
-  bsm load <name>         Load a saved session config as a tmux session named <name>.
-                          Runs alongside other live sessions; prompts on collision.
-  bsm list                List saved configs with live/drift status
-  bsm show <name>         Show contents of a saved config
-  bsm delete <name>       Delete a saved session config (use -f to skip confirmation)
-  bsm shutdown [name|all] Shut down a session (default: current when inside tmux,
-                          else picker). Use "all" to kill the entire byobu server.
-  bsm help                Show this help
+  bsm save [--no-csm] [name]         Save current byobu session as <name>
+                                     (no arg: defaults to current session name when inside tmux)
+  bsm load [--no-csm] <name>         Load a saved session config as tmux session <name>.
+                                     Runs alongside other live sessions; prompts on collision.
+  bsm list                           List saved configs with live/drift status
+  bsm show <name>                    Show contents of a saved config
+  bsm delete <name>                  Delete a saved session config (use -f to skip confirmation)
+  bsm shutdown [--no-csm] [name|all] Shut down a session (default: current when inside tmux,
+                                     else picker). Use "all" to kill the byobu server.
+  bsm help                           Show this help
+
+Coupling: load/save/shutdown also act on the matching csm session by name
+when csm is installed. Pass --no-csm to opt out of coupling per-call.
 
 Configs are stored as JSON in ~/.config/byobu-sessions/
 EOF
@@ -80,6 +83,74 @@ _get_full_command() {
     else
         ps -p "$first_child" -o args= 2>/dev/null | sed 's/^ *//'
     fi
+}
+
+# ── csm coupling ─────────────────────────────────────────────────────────────
+# bsm and csm pair by name: a config <name> in either tool refers to the same
+# work context. When a bsm session is loaded/saved/shut down, the matching csm
+# instance follows. Each helper is a no-op when the matching csm config or
+# instance doesn't exist, so coupling is safe even when csm isn't in use.
+# Disable by passing --no-csm to bsm load/save/shutdown.
+
+CSM_CONFIG_DIR="$HOME/.config/chrome-sessions"
+
+_csm_available() {
+    command -v csm >/dev/null 2>&1
+}
+
+# If a csm config <name> exists and no instance is running for <name>,
+# launch one. Echoes a status line on action.
+_csm_load_if_config() {
+    local name="$1"
+    _csm_available || return 0
+    [ -f "$CSM_CONFIG_DIR/${name}.json" ] || return 0
+    if csm status "$name" >/dev/null 2>&1; then
+        echo "csm: '$name' already running — leaving as is."
+        return 0
+    fi
+    echo "csm: loading '$name'..."
+    csm load "$name" || echo "csm: load '$name' failed (continuing)." >&2
+}
+
+# If a csm instance is running for <name>, snapshot its tabs into config <name>.
+_csm_save_if_running() {
+    local name="$1"
+    _csm_available || return 0
+    if csm status "$name" >/dev/null 2>&1; then
+        echo "csm: saving '$name'..."
+        csm save "$name" >/dev/null || echo "csm: save '$name' failed (continuing)." >&2
+    fi
+}
+
+# If a csm instance is running for <name>, stop it quietly (no save prompt).
+_csm_stop_if_running() {
+    local name="$1"
+    _csm_available || return 0
+    if csm status "$name" >/dev/null 2>&1; then
+        echo "csm: stopping '$name'..."
+        csm stop "$name" --quiet || echo "csm: stop '$name' failed (continuing)." >&2
+    fi
+}
+
+# Strip --no-csm from argv. Sets NO_CSM=1 if present, else 0.
+# Reassigns positional parameters in the caller via printf-eval pattern.
+# Usage: eval "$(_parse_no_csm_flag "$@")"
+_parse_no_csm_flag() {
+    local args=()
+    local nocsm=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-csm) nocsm=1 ;;
+            *) args+=("$1") ;;
+        esac
+        shift
+    done
+    printf 'NO_CSM=%s; set --' "$nocsm"
+    local a
+    for a in "${args[@]}"; do
+        printf ' %q' "$a"
+    done
+    printf '\n'
 }
 
 # ── Save ─────────────────────────────────────────────────────────────────────
@@ -157,6 +228,8 @@ _save_session() {
 }
 
 cmd_save() {
+    local NO_CSM=0
+    eval "$(_parse_no_csm_flag "$@")"
     local name="${1:-}"
     _require_byobu
 
@@ -165,7 +238,7 @@ cmd_save() {
         # No name → must be inside tmux; default name = current session name.
         if [ -z "${TMUX:-}" ]; then
             echo "Error: No name given and not inside a byobu session." >&2
-            echo "Usage: bsm save <name>" >&2
+            echo "Usage: bsm save [--no-csm] <name>" >&2
             exit 1
         fi
         target_session=$(tmux display-message -p '#S')
@@ -175,6 +248,7 @@ cmd_save() {
     fi
 
     _save_session "$name" "$target_session"
+    [ "$NO_CSM" -eq 0 ] && _csm_save_if_running "$name"
     echo ""
     cmd_show "$name"
 }
@@ -193,7 +267,9 @@ _attach_or_switch() {
 }
 
 cmd_load() {
-    local name="${1:?Usage: bsm load <name>}"
+    local NO_CSM=0
+    eval "$(_parse_no_csm_flag "$@")"
+    local name="${1:?Usage: bsm load [--no-csm] <name>}"
     local config_file="$CONFIG_DIR/${name}.json"
 
     if [ ! -f "$config_file" ]; then
@@ -214,6 +290,7 @@ cmd_load() {
         read -rp "Choice [a/r/c]: " ans
         case "$ans" in
             a|A)
+                [ "$NO_CSM" -eq 0 ] && _csm_load_if_config "$name"
                 _attach_or_switch "$session"
                 return
                 ;;
@@ -274,6 +351,7 @@ cmd_load() {
     # Select the first window
     byobu select-window -t "${session}:0"
 
+    [ "$NO_CSM" -eq 0 ] && _csm_load_if_config "$name"
     _attach_or_switch "$session"
 }
 
@@ -435,6 +513,8 @@ cmd_delete() {
 # ── Shutdown ─────────────────────────────────────────────────────────────────
 
 cmd_shutdown() {
+    local NO_CSM=0
+    eval "$(_parse_no_csm_flag "$@")"
     _require_byobu
 
     local arg="${1:-}"
@@ -484,12 +564,17 @@ cmd_shutdown() {
                 read -rp "Save '$s' as (blank to skip): " save_name
                 if [ -n "$save_name" ]; then
                     _save_session "$save_name" "$s"
+                    [ "$NO_CSM" -eq 0 ] && _csm_save_if_running "$save_name"
                 fi
             done
         fi
         local ans
         read -rp "Kill ALL byobu sessions? This terminates every running process. [y/N] " ans
         if [[ "$ans" =~ ^[Yy]$ ]]; then
+            if [ "$NO_CSM" -eq 0 ] && _csm_available; then
+                echo "csm: stopping all running sessions..."
+                csm stop all --quiet 2>/dev/null || true
+            fi
             byobu kill-server
             echo "All sessions terminated."
         else
@@ -510,11 +595,13 @@ cmd_shutdown() {
         read -rp "Save name [$target]: " save_name
         save_name="${save_name:-$target}"
         _save_session "$save_name" "$target"
+        [ "$NO_CSM" -eq 0 ] && _csm_save_if_running "$save_name"
     fi
 
     local ans
     read -rp "Kill session '$target'? [y/N] " ans
     if [[ "$ans" =~ ^[Yy]$ ]]; then
+        [ "$NO_CSM" -eq 0 ] && _csm_stop_if_running "$target"
         tmux kill-session -t "$target"
         echo "Session '$target' terminated."
     else
