@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # csm — Chrome Session Manager
-# Save, load, list, and show Chrome debug-mode tab sessions with named configs.
+# Save, load, list, and show parallel Chrome debug-mode sessions, each backed
+# by its own user-data-dir and auto-allocated debug port.
 
 set -euo pipefail
 
 CONFIG_DIR="$HOME/.config/chrome-sessions"
-DEBUG_PORT="${CSM_DEBUG_PORT:-9222}"
-USER_DATA_DIR="${CSM_USER_DATA_DIR:-$CONFIG_DIR/profile}"
-# Word-split CSM_CHROME_ARGS into an array (may be empty).
+STATE_DIR="$CONFIG_DIR/state"
+PROFILES_DIR="$CONFIG_DIR/profiles"
+BASE_PORT="${CSM_BASE_PORT:-${CSM_DEBUG_PORT:-9222}}"
 read -r -a EXTRA_CHROME_ARGS <<< "${CSM_CHROME_ARGS:-}"
-mkdir -p "$CONFIG_DIR"
+mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$PROFILES_DIR"
 
 # ── Color setup ──────────────────────────────────────────────────────────────
-# Respect NO_COLOR and disable when stdout isn't a terminal.
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     C_BOLD=$'\033[1m'
     C_DIM=$'\033[2m'
@@ -24,7 +24,6 @@ else
     C_BOLD='' C_DIM='' C_CYAN='' C_GREEN='' C_YELLOW='' C_RESET=''
 fi
 
-# Print N box-drawing horizontal line characters
 _hr() {
     local n="$1" out='' i=0
     while [ "$i" -lt "$n" ]; do
@@ -36,29 +35,36 @@ _hr() {
 
 usage() {
     cat <<EOF
-csm — Chrome Session Manager
+csm — Chrome Session Manager (parallel debug-mode sessions)
 
 Usage:
-  csm start               Launch an empty debug-mode Chrome on the debug port
-  csm stop                Stop the running debug-mode Chrome (offers to save first)
-  csm status              Show whether debug Chrome is running + tab count
-  csm save <name>         Save current debug-mode Chrome tabs as <name>
-  csm load <name>         Launch Chrome in debug mode with tabs from <name>
-  csm list                List saved tab configs
-  csm show <name>         Show contents of a saved config
-  csm help                Show this help
+  csm start <name>            Launch an empty debug Chrome under <name>.
+  csm stop [name|all] [-q]    Stop a debug Chrome (default: only-running, current
+                              if exactly one). "all" stops every running instance.
+                              -q / --quiet skips the save + confirm prompts.
+  csm status [name]           Show all running sessions; or details for <name>.
+  csm save [name]             Save tabs from a running session.
+                              No name → only-running; multiple running → picker.
+  csm load <name>             Launch Chrome under <name> with saved tabs.
+                              Prompts attach / reload / cancel if already running.
+  csm list                    List saved configs with live status + tab titles.
+  csm show <name>             Show every tab in a saved config.
+  csm help                    Show this help.
 
 Environment:
-  CSM_DEBUG_PORT          Chrome remote-debugging port (default: 9222)
-  CSM_CHROME_BIN          Chrome binary to use (default: auto-detect)
-  CSM_USER_DATA_DIR       Chrome user-data-dir (default: ~/.config/chrome-sessions/profile)
-  CSM_CHROME_ARGS         Extra args appended to the chrome launch command
+  CSM_BASE_PORT     Base port for debug-port allocation (default: 9222).
+                    (Legacy alias: CSM_DEBUG_PORT.)
+  CSM_CHROME_BIN    Chrome binary to use (default: auto-detect).
+  CSM_CHROME_ARGS   Extra args appended to every chrome launch command.
 
-Configs are stored as JSON in ~/.config/chrome-sessions/
+Per-session state:
+  Profiles    ~/.config/chrome-sessions/profiles/<name>/
+  PID/port    ~/.config/chrome-sessions/state/<name>.json
+  Configs     ~/.config/chrome-sessions/<name>.json
 EOF
 }
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Helpers: chrome bin ──────────────────────────────────────────────────────
 
 _find_chrome() {
     if [ -n "${CSM_CHROME_BIN:-}" ]; then
@@ -77,25 +83,6 @@ _find_chrome() {
     echo ""
 }
 
-_debug_chrome_alive() {
-    curl -fsS --max-time 2 "http://localhost:$DEBUG_PORT/json/version" >/dev/null 2>&1
-}
-
-_require_debug_chrome() {
-    if ! _debug_chrome_alive; then
-        cat >&2 <<EOF
-Error: Chrome debug port $DEBUG_PORT is not responding.
-
-Start one with:
-  csm start
-
-Or launch Chrome manually:
-  google-chrome --remote-debugging-port=$DEBUG_PORT
-EOF
-        exit 1
-    fi
-}
-
 _require_chrome_bin() {
     local bin
     bin=$(_find_chrome)
@@ -107,142 +94,433 @@ _require_chrome_bin() {
     echo "$bin"
 }
 
+# ── Helpers: port + state ────────────────────────────────────────────────────
+
+_state_file()  { echo "$STATE_DIR/$1.json"; }
+_profile_dir() { echo "$PROFILES_DIR/$1"; }
+
+_port_free() {
+    local port="$1"
+    ! (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null
+}
+
+_alloc_port() {
+    local port="$BASE_PORT"
+    local max=$((BASE_PORT + 100))
+    while [ "$port" -lt "$max" ]; do
+        if _port_free "$port"; then
+            echo "$port"
+            return
+        fi
+        port=$((port + 1))
+    done
+    echo "Error: no free debug port in [$BASE_PORT, $max)" >&2
+    return 1
+}
+
+_debug_alive_at() {
+    local port="$1"
+    curl -fsS --max-time 2 "http://localhost:$port/json/version" >/dev/null 2>&1
+}
+
+_session_port() {
+    local f
+    f=$(_state_file "$1")
+    [ -f "$f" ] || return 1
+    jq -r '.port' "$f"
+}
+
+_session_pid() {
+    local f
+    f=$(_state_file "$1")
+    [ -f "$f" ] || return 1
+    jq -r '.pid' "$f"
+}
+
+_session_alive() {
+    local port
+    port=$(_session_port "$1" 2>/dev/null) || return 1
+    [ -n "$port" ] && _debug_alive_at "$port"
+}
+
+_clean_state_for() {
+    rm -f "$(_state_file "$1")"
+}
+
+# Walk state dir; remove stale entries whose port no longer responds.
+_clean_dead_state() {
+    local f name
+    [ -d "$STATE_DIR" ] || return 0
+    for f in "$STATE_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f" .json)
+        if ! _session_alive "$name"; then
+            rm -f "$f"
+        fi
+    done
+}
+
+# Echo names of running sessions, one per line.
+_running_sessions() {
+    _clean_dead_state
+    local f name
+    [ -d "$STATE_DIR" ] || return 0
+    for f in "$STATE_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f" .json)
+        echo "$name"
+    done
+}
+
 _wait_for_debug_port() {
-    # Poll the debug port until it responds or ~5s elapses. Returns 0 if alive.
+    local port="$1"
     local waited=0
-    while ! _debug_chrome_alive && [ "$waited" -lt 10 ]; do
+    while ! _debug_alive_at "$port" && [ "$waited" -lt 10 ]; do
         sleep 0.5
         waited=$((waited + 1))
     done
-    _debug_chrome_alive
+    _debug_alive_at "$port"
 }
 
-_wait_for_debug_port_dead() {
-    local waited=0
-    while _debug_chrome_alive && [ "$waited" -lt 10 ]; do
-        sleep 0.5
-        waited=$((waited + 1))
-    done
-    ! _debug_chrome_alive
-}
-
-# ── Start ────────────────────────────────────────────────────────────────────
-
-cmd_start() {
-    if _debug_chrome_alive; then
-        echo "Debug chrome already running on port $DEBUG_PORT."
-        echo "Endpoint: http://localhost:$DEBUG_PORT"
-        return 0
-    fi
+# Launch a new Chrome instance under <name> with the given URLs (which may be
+# empty for an empty Chrome). Writes state on success.
+# Args: $1 = name, rest = URLs.
+_launch_session() {
+    local name="$1"
+    shift
+    local urls=("$@")
 
     local chrome_bin
     chrome_bin=$(_require_chrome_bin)
 
-    echo "Starting $chrome_bin with --remote-debugging-port=$DEBUG_PORT..."
+    local profile_dir
+    profile_dir=$(_profile_dir "$name")
+    mkdir -p "$profile_dir"
+
+    local port
+    port=$(_alloc_port) || exit 1
+
+    echo "Launching '$name' on port $port via $chrome_bin..."
 
     nohup "$chrome_bin" \
-        --remote-debugging-port="$DEBUG_PORT" \
-        --user-data-dir="$USER_DATA_DIR" \
+        --remote-debugging-port="$port" \
+        --user-data-dir="$profile_dir" \
         ${EXTRA_CHROME_ARGS[@]+"${EXTRA_CHROME_ARGS[@]}"} \
+        "${urls[@]}" \
         >/dev/null 2>&1 &
+    local pid=$!
     disown
 
-    if _wait_for_debug_port; then
-        echo "✓ Debug chrome started. Endpoint: http://localhost:$DEBUG_PORT"
-    else
+    if ! _wait_for_debug_port "$port"; then
         cat >&2 <<EOF
-Warning: Launched chrome but debug port $DEBUG_PORT is not responding.
+Warning: Launched chrome but debug port $port is not responding.
 
-This usually means another Chrome instance is already running. The
-debug-port flags get forwarded to the existing window and are ignored.
-
-Fix: close the other Chrome first, then re-run 'csm start'.
+The flags may have been forwarded to an existing Chrome instance with the
+same profile dir and ignored. Try 'csm stop $name' and retry, or close any
+Chrome windows using the profile and try again.
 EOF
-        exit 1
+        return 1
     fi
-}
-
-# ── Stop ─────────────────────────────────────────────────────────────────────
-
-cmd_stop() {
-    if ! _debug_chrome_alive; then
-        echo "No debug chrome running on port $DEBUG_PORT."
-        return 0
-    fi
-
-    read -rp "Save current session before stopping? [Y/n] " save_answer
-    if [[ ! "$save_answer" =~ ^[Nn]$ ]]; then
-        read -rp "Save name: " save_name
-        if [ -n "$save_name" ]; then
-            cmd_save "$save_name"
-            echo ""
-        fi
-    fi
-
-    read -rp "Kill debug chrome on port $DEBUG_PORT? [y/N] " answer
-    if [[ "$answer" =~ ^[Yy]$ ]]; then
-        pkill -f "remote-debugging-port=$DEBUG_PORT" 2>/dev/null || true
-        if _wait_for_debug_port_dead; then
-            echo "Debug chrome stopped."
-        else
-            echo "Warning: debug chrome still responding on port $DEBUG_PORT." >&2
-            exit 1
-        fi
-    else
-        echo "Aborted."
-    fi
-}
-
-# ── Status ───────────────────────────────────────────────────────────────────
-
-cmd_status() {
-    if _debug_chrome_alive; then
-        local browser tab_count
-        browser=$(curl -fsS "http://localhost:$DEBUG_PORT/json/version" | jq -r '.Browser // "unknown"')
-        tab_count=$(curl -fsS "http://localhost:$DEBUG_PORT/json" | jq '[.[] | select(.type == "page")] | length')
-        printf "${C_GREEN}●${C_RESET} debug chrome alive on port ${C_CYAN}%s${C_RESET}\n" "$DEBUG_PORT"
-        printf "  browser:  ${C_DIM}%s${C_RESET}\n" "$browser"
-        printf "  tabs:     ${C_DIM}%s${C_RESET}\n" "$tab_count"
-        printf "  endpoint: ${C_DIM}http://localhost:%s${C_RESET}\n" "$DEBUG_PORT"
-    else
-        printf "${C_YELLOW}○${C_RESET} no debug chrome on port ${C_CYAN}%s${C_RESET}\n" "$DEBUG_PORT"
-        printf "  start one with: ${C_BOLD}csm start${C_RESET}\n"
-        exit 1
-    fi
-}
-
-# ── Save ─────────────────────────────────────────────────────────────────────
-
-cmd_save() {
-    local name="${1:?Usage: csm save <name>}"
-    _require_debug_chrome
-
-    local config_file="$CONFIG_DIR/${name}.json"
-
-    local tabs_json
-    tabs_json=$(curl -fsS "http://localhost:$DEBUG_PORT/json" \
-        | jq '[.[] | select(.type == "page")]
-              | to_entries
-              | map({index: .key, title: .value.title, url: .value.url})')
-
-    local browser
-    browser=$(curl -fsS "http://localhost:$DEBUG_PORT/json/version" | jq -r '.Browser // "unknown"')
 
     jq -n \
         --arg name "$name" \
+        --argjson pid "$pid" \
+        --argjson port "$port" \
+        --arg started_at "$(date -Iseconds)" \
+        '{name: $name, pid: $pid, port: $port, started_at: $started_at}' \
+        > "$(_state_file "$name")"
+
+    echo "✓ '$name' alive. Endpoint: http://localhost:$port"
+}
+
+# ── Commands: start ──────────────────────────────────────────────────────────
+
+cmd_start() {
+    local name="${1:?Usage: csm start <name>}"
+
+    if _session_alive "$name"; then
+        local port
+        port=$(_session_port "$name")
+        echo "'$name' already running on port $port."
+        echo "Endpoint: http://localhost:$port"
+        return 0
+    fi
+
+    _clean_state_for "$name"
+    _launch_session "$name"
+}
+
+# ── Commands: stop ───────────────────────────────────────────────────────────
+
+# Kill a single named session and clean its state.
+_stop_session() {
+    local name="$1"
+    local pid port
+    pid=$(_session_pid "$name" 2>/dev/null || true)
+    port=$(_session_port "$name" 2>/dev/null || true)
+
+    if [ -z "$port" ] || ! _debug_alive_at "$port"; then
+        _clean_state_for "$name"
+        return 0
+    fi
+
+    echo "Stopping '$name' (pid $pid, port $port)..."
+    if [ -n "$pid" ] && [ "$pid" != "null" ]; then
+        kill "$pid" 2>/dev/null || true
+    fi
+    pkill -f "remote-debugging-port=$port" 2>/dev/null || true
+
+    local waited=0
+    while _debug_alive_at "$port" && [ "$waited" -lt 10 ]; do
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+
+    _clean_state_for "$name"
+
+    if _debug_alive_at "$port"; then
+        echo "Warning: port $port still responding after kill." >&2
+        return 1
+    fi
+    echo "Stopped '$name'."
+}
+
+cmd_stop() {
+    local quiet=0
+    local arg=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -q|--quiet) quiet=1 ;;
+            -*) echo "Unknown flag: $1" >&2; exit 1 ;;
+            *)  arg="$1" ;;
+        esac
+        shift
+    done
+
+    local running=()
+    local s
+    while IFS= read -r s; do
+        [ -n "$s" ] && running+=("$s")
+    done < <(_running_sessions)
+
+    if [ "${#running[@]}" -eq 0 ]; then
+        echo "No running debug-chrome sessions."
+        return 0
+    fi
+
+    local target=""
+    if [ "$arg" = "all" ] || [ "$arg" = "--all" ]; then
+        if [ "$quiet" -eq 0 ]; then
+            local saveq
+            read -rp "Save any sessions before stopping? [y/N] " saveq
+            if [[ "$saveq" =~ ^[Yy]$ ]]; then
+                for s in "${running[@]}"; do
+                    local sn
+                    read -rp "Save '$s' as (blank to skip): " sn
+                    if [ -n "$sn" ]; then
+                        _save_session "$sn" "$s"
+                    fi
+                done
+            fi
+        fi
+        for s in "${running[@]}"; do
+            _stop_session "$s"
+        done
+        return
+    fi
+
+    if [ -n "$arg" ]; then
+        target="$arg"
+    elif [ "${#running[@]}" -eq 1 ]; then
+        target="${running[0]}"
+    else
+        echo "Running sessions:"
+        local i=1
+        for s in "${running[@]}"; do
+            echo "  $i) $s"
+            i=$((i + 1))
+        done
+        local pick
+        read -rp "Pick session to stop [1-${#running[@]}]: " pick
+        if ! [[ "$pick" =~ ^[0-9]+$ ]] || [ "$pick" -lt 1 ] || [ "$pick" -gt "${#running[@]}" ]; then
+            echo "Aborted."
+            exit 0
+        fi
+        target="${running[$((pick - 1))]}"
+    fi
+
+    if ! _session_alive "$target"; then
+        echo "No running session '$target'."
+        _clean_state_for "$target"
+        return 0
+    fi
+
+    if [ "$quiet" -eq 0 ]; then
+        local saveq
+        read -rp "Save '$target' tabs before stop? [Y/n] " saveq
+        if [[ ! "$saveq" =~ ^[Nn]$ ]]; then
+            local sn
+            read -rp "Save name [$target]: " sn
+            sn="${sn:-$target}"
+            _save_session "$sn" "$target"
+        fi
+    fi
+
+    _stop_session "$target"
+}
+
+# ── Commands: status ─────────────────────────────────────────────────────────
+
+cmd_status() {
+    local name="${1:-}"
+
+    if [ -n "$name" ]; then
+        if ! _session_alive "$name"; then
+            printf "${C_YELLOW}○${C_RESET} '%s' is not running.\n" "$name"
+            exit 1
+        fi
+        local port pid browser tab_count
+        port=$(_session_port "$name")
+        pid=$(_session_pid "$name")
+        browser=$(curl -fsS "http://localhost:$port/json/version" | jq -r '.Browser // "unknown"')
+        tab_count=$(curl -fsS "http://localhost:$port/json" | jq '[.[] | select(.type == "page")] | length')
+        printf "${C_GREEN}●${C_RESET} %s alive (pid ${C_CYAN}%s${C_RESET}, port ${C_CYAN}%s${C_RESET})\n" "$name" "$pid" "$port"
+        printf "  browser:  ${C_DIM}%s${C_RESET}\n" "$browser"
+        printf "  tabs:     ${C_DIM}%s${C_RESET}\n" "$tab_count"
+        printf "  endpoint: ${C_DIM}http://localhost:%s${C_RESET}\n" "$port"
+        return
+    fi
+
+    local running=()
+    local s
+    while IFS= read -r s; do
+        [ -n "$s" ] && running+=("$s")
+    done < <(_running_sessions)
+
+    if [ "${#running[@]}" -eq 0 ]; then
+        printf "${C_YELLOW}○${C_RESET} No debug chrome sessions running.\n"
+        exit 1
+    fi
+
+    printf "${C_BOLD}Running debug-chrome sessions:${C_RESET}\n\n"
+    printf "  ${C_CYAN}${C_BOLD}%-12s  %-6s  %-7s  %s${C_RESET}\n" "NAME" "PORT" "PID" "TABS"
+    printf "  ${C_DIM}%s  %s  %s  %s${C_RESET}\n" "$(_hr 12)" "$(_hr 6)" "$(_hr 7)" "$(_hr 4)"
+    for s in "${running[@]}"; do
+        local port pid tab_count
+        port=$(_session_port "$s")
+        pid=$(_session_pid "$s")
+        tab_count=$(curl -fsS --max-time 2 "http://localhost:$port/json" 2>/dev/null \
+            | jq '[.[] | select(.type == "page")] | length' 2>/dev/null || echo "?")
+        printf "  ${C_BOLD}%-12s${C_RESET}  ${C_CYAN}%-6s${C_RESET}  ${C_DIM}%-7s${C_RESET}  ${C_GREEN}%s${C_RESET}\n" \
+            "$s" "$port" "$pid" "$tab_count"
+    done
+}
+
+# ── Commands: save ───────────────────────────────────────────────────────────
+
+# Snapshot a running session's tabs into config <save_name>.
+# Args: $1 = save_name, $2 = source_session_name
+_save_session() {
+    local save_name="$1"
+    local source="$2"
+
+    local port
+    port=$(_session_port "$source") || {
+        echo "Error: no running session '$source'." >&2
+        return 1
+    }
+    if ! _debug_alive_at "$port"; then
+        echo "Error: session '$source' not responding on port $port." >&2
+        return 1
+    fi
+
+    local config_file="$CONFIG_DIR/${save_name}.json"
+    local tabs_json browser
+    tabs_json=$(curl -fsS "http://localhost:$port/json" \
+        | jq '[.[] | select(.type == "page")]
+              | to_entries
+              | map({index: .key, title: .value.title, url: .value.url})')
+    browser=$(curl -fsS "http://localhost:$port/json/version" | jq -r '.Browser // "unknown"')
+
+    jq -n \
+        --arg name "$save_name" \
         --arg saved_at "$(date -Iseconds)" \
         --arg browser "$browser" \
-        --argjson port "$DEBUG_PORT" \
+        --argjson port "$port" \
         --argjson tabs "$tabs_json" \
         '{name: $name, saved_at: $saved_at, browser: $browser, debug_port: $port, tabs: $tabs}' \
         > "$config_file"
 
-    echo "Saved session as '$name' → $config_file"
+    echo "Saved session '$source' as '$save_name' → $config_file"
+}
+
+cmd_save() {
+    local name="${1:-}"
+    local running=()
+    local s
+    while IFS= read -r s; do
+        [ -n "$s" ] && running+=("$s")
+    done < <(_running_sessions)
+
+    if [ "${#running[@]}" -eq 0 ]; then
+        echo "Error: no debug-chrome sessions running. Start one with 'csm start <name>'." >&2
+        exit 1
+    fi
+
+    local source=""
+    if [ -n "$name" ]; then
+        for s in "${running[@]}"; do
+            if [ "$s" = "$name" ]; then
+                source="$s"
+                break
+            fi
+        done
+        if [ -z "$source" ]; then
+            if [ "${#running[@]}" -eq 1 ]; then
+                source="${running[0]}"
+            else
+                echo "Multiple sessions running, none named '$name':"
+                local i=1
+                for s in "${running[@]}"; do
+                    echo "  $i) $s"
+                    i=$((i + 1))
+                done
+                local pick
+                read -rp "Pick session to save as '$name' [1-${#running[@]}]: " pick
+                if ! [[ "$pick" =~ ^[0-9]+$ ]] || [ "$pick" -lt 1 ] || [ "$pick" -gt "${#running[@]}" ]; then
+                    echo "Aborted."
+                    exit 0
+                fi
+                source="${running[$((pick - 1))]}"
+            fi
+        fi
+    else
+        if [ "${#running[@]}" -gt 1 ]; then
+            echo "Multiple sessions running. Pass a name or pick:" >&2
+            local i=1
+            for s in "${running[@]}"; do
+                echo "  $i) $s" >&2
+                i=$((i + 1))
+            done
+            local pick
+            read -rp "Pick session to save (under same name) [1-${#running[@]}]: " pick
+            if ! [[ "$pick" =~ ^[0-9]+$ ]] || [ "$pick" -lt 1 ] || [ "$pick" -gt "${#running[@]}" ]; then
+                echo "Aborted."
+                exit 0
+            fi
+            source="${running[$((pick - 1))]}"
+        else
+            source="${running[0]}"
+        fi
+        name="$source"
+    fi
+
+    _save_session "$name" "$source"
     echo ""
     cmd_show "$name"
 }
 
-# ── Load ─────────────────────────────────────────────────────────────────────
+# ── Commands: load ───────────────────────────────────────────────────────────
 
 cmd_load() {
     local name="${1:?Usage: csm load <name>}"
@@ -253,9 +531,6 @@ cmd_load() {
         exit 1
     fi
 
-    local chrome_bin
-    chrome_bin=$(_require_chrome_bin)
-
     local tab_count
     tab_count=$(jq '.tabs | length' "$config_file")
 
@@ -264,16 +539,30 @@ cmd_load() {
         exit 1
     fi
 
-    if _debug_chrome_alive; then
-        read -rp "A debug Chrome is already running on port $DEBUG_PORT. Kill it and load '$name'? [y/N] " answer
-        if [[ "$answer" =~ ^[Yy]$ ]]; then
-            pkill -f "remote-debugging-port=$DEBUG_PORT" 2>/dev/null || true
-            _wait_for_debug_port_dead || true
-        else
-            echo "Aborted."
-            exit 0
-        fi
+    if _session_alive "$name"; then
+        local port
+        port=$(_session_port "$name")
+        echo "Session '$name' is already running on port $port."
+        echo "  [a] leave it (no-op)"
+        echo "  [r] reload (kill and recreate from saved config)"
+        echo "  [c] cancel"
+        local ans
+        read -rp "Choice [a/r/c]: " ans
+        case "$ans" in
+            a|A)
+                echo "Leaving '$name' running. Endpoint: http://localhost:$port"
+                return 0
+                ;;
+            r|R)
+                _stop_session "$name"
+                ;;
+            *)
+                echo "Aborted."
+                exit 0
+                ;;
+        esac
     fi
+    _clean_state_for "$name"
 
     local urls=()
     local url
@@ -281,69 +570,87 @@ cmd_load() {
         [ -n "$url" ] && urls+=("$url")
     done < <(jq -r '.tabs[].url' "$config_file")
 
-    echo "Loading '$name' ($tab_count tabs) via $chrome_bin..."
-
-    # Launch detached so csm doesn't block the terminal.
-    nohup "$chrome_bin" \
-        --remote-debugging-port="$DEBUG_PORT" \
-        --user-data-dir="$USER_DATA_DIR" \
-        ${EXTRA_CHROME_ARGS[@]+"${EXTRA_CHROME_ARGS[@]}"} \
-        "${urls[@]}" \
-        >/dev/null 2>&1 &
-    disown
-
-    echo "Chrome launched. Debug endpoint: http://localhost:$DEBUG_PORT"
+    _launch_session "$name" "${urls[@]}"
 }
 
-# ── List ─────────────────────────────────────────────────────────────────────
+# ── Commands: list ───────────────────────────────────────────────────────────
+
+_render_status_cell() {
+    local status="$1" width="$2" out='' visible=0
+    case "$status" in
+        live)
+            out="${C_GREEN}● live${C_RESET}"
+            visible=6
+            ;;
+    esac
+    local pad=$((width - visible))
+    (( pad > 0 )) && out+="$(printf '%*s' "$pad" '')"
+    printf '%s' "$out"
+}
 
 cmd_list() {
-    local configs
-    configs=$(find "$CONFIG_DIR" -name '*.json' -type f 2>/dev/null)
-
-    if [ -z "$configs" ]; then
+    local found=0
+    local f
+    for f in "$CONFIG_DIR"/*.json; do
+        [ -f "$f" ] && found=1 && break
+    done
+    if [ "$found" -eq 0 ]; then
         echo "No saved sessions. Use 'csm save <name>' to save one."
         return
     fi
 
-    # Collect rows and compute column widths dynamically so data never overflows.
+    declare -A live_names
+    local s
+    while IFS= read -r s; do
+        [ -n "$s" ] && live_names["$s"]=1
+    done < <(_running_sessions)
+
+    local term_cols
+    term_cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 120)}
+
     local rows=()
-    local w_name=4 w_date=8
-    local f sname saved_at tab_count first_title summary
+    local w_name=4 w_date=8 w_status=6
+    local sname saved_at tabs_full status
     for f in "$CONFIG_DIR"/*.json; do
         [ -f "$f" ] || continue
-        sname=$(jq -r '.name' "$f")
+        sname=$(jq -r '.name // empty' "$f" 2>/dev/null)
+        [ -z "$sname" ] && continue
         saved_at=$(jq -r '.saved_at | sub("T"; " ") | sub("[+-][0-9]{2}:[0-9]{2}$"; "")' "$f")
-        tab_count=$(jq -r '.tabs | length' "$f")
-        first_title=$(jq -r '.tabs[0].title // "(empty)"' "$f")
-        if [ "${#first_title}" -gt 50 ]; then
-            first_title="${first_title:0:47}..."
-        fi
-        if [ "$tab_count" = "1" ]; then
-            summary="${tab_count} tab — ${first_title}"
-        else
-            summary="${tab_count} tabs — ${first_title}"
-        fi
-        rows+=("${sname}"$'\t'"${saved_at}"$'\t'"${summary}")
+        tabs_full=$(jq -r '[.tabs[].title] | join(", ")' "$f")
+        status=""
+        [ -n "${live_names[$sname]+x}" ] && status="live"
+
+        rows+=("${sname}"$'\x1f'"${saved_at}"$'\x1f'"${status}"$'\x1f'"${tabs_full}")
         (( ${#sname}    > w_name )) && w_name=${#sname}
         (( ${#saved_at} > w_date )) && w_date=${#saved_at}
     done
 
+    # Layout: 2sp + name + 2sp + date + 2sp + status + 2sp + tabs
+    local fixed=$((2 + w_name + 2 + w_date + 2 + w_status + 2))
+    local w_tabs=$((term_cols - fixed))
+    (( w_tabs < 20 )) && w_tabs=20
+
     printf "${C_BOLD}Saved chrome sessions:${C_RESET}\n\n"
-    printf "  ${C_CYAN}${C_BOLD}%-*s  %-*s  %s${C_RESET}\n" \
-        "$w_name" "NAME" "$w_date" "SAVED AT" "TABS"
-    printf "  ${C_DIM}%s  %s  %s${C_RESET}\n" \
-        "$(_hr "$w_name")" "$(_hr "$w_date")" "$(_hr 4)"
+    printf "  ${C_CYAN}${C_BOLD}%-*s  %-*s  %-*s  %s${C_RESET}\n" \
+        "$w_name" "NAME" "$w_date" "SAVED AT" "$w_status" "STATUS" "TABS"
+    printf "  ${C_DIM}%s  %s  %s  %s${C_RESET}\n" \
+        "$(_hr "$w_name")" "$(_hr "$w_date")" "$(_hr "$w_status")" "$(_hr 4)"
 
     local row
     for row in "${rows[@]}"; do
-        IFS=$'\t' read -r sname saved_at summary <<< "$row"
-        printf "  ${C_BOLD}%-*s${C_RESET}  ${C_DIM}%-*s${C_RESET}  ${C_GREEN}%s${C_RESET}\n" \
-            "$w_name" "$sname" "$w_date" "$saved_at" "$summary"
+        IFS=$'\x1f' read -r sname saved_at status tabs_full <<< "$row"
+        local status_cell
+        status_cell=$(_render_status_cell "$status" "$w_status")
+        local tabs_cell="$tabs_full"
+        if [ "${#tabs_cell}" -gt "$w_tabs" ]; then
+            tabs_cell="${tabs_cell:0:$((w_tabs - 1))}…"
+        fi
+        printf "  ${C_BOLD}%-*s${C_RESET}  ${C_DIM}%-*s${C_RESET}  %s  ${C_GREEN}%s${C_RESET}\n" \
+            "$w_name" "$sname" "$w_date" "$saved_at" "$status_cell" "$tabs_cell"
     done
 }
 
-# ── Show ─────────────────────────────────────────────────────────────────────
+# ── Commands: show ───────────────────────────────────────────────────────────
 
 cmd_show() {
     local name="${1:?Usage: csm show <name>}"
@@ -358,7 +665,6 @@ cmd_show() {
     tab_count=$(jq '.tabs | length' "$config_file")
     browser=$(jq -r '.browser // "unknown"' "$config_file")
 
-    # Collect rows and compute column widths dynamically.
     local rows=()
     local w_idx=1 w_title=5
     local idx title url

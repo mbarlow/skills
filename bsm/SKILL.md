@@ -11,20 +11,30 @@ user_invocable: true
 ## Commands
 
 ```bash
-bsm save [name]          # Save current byobu session as <name>
-                         # (no arg: defaults to current session name when inside tmux)
-bsm load <name>          # Load a saved config as a tmux session named <name>.
-                         # Runs alongside other live sessions; prompts if <name> already exists.
-bsm list                 # List all saved configs with live/drift status
-bsm show <name>          # Show detailed window layout of a saved config
-bsm delete <name>        # Delete a saved config (prompts; -f to skip confirmation)
-bsm shutdown [name|all]  # Shut down a session (default: current when inside tmux,
-                         # else picker). Use "all" to kill the entire byobu server.
+bsm save [--no-csm] [name]          # Save current byobu session as <name>
+                                    # (no arg: defaults to current session name when inside tmux)
+bsm load [--no-csm] <name>          # Load a saved config as a tmux session named <name>.
+                                    # Runs alongside other live sessions; prompts if already exists.
+bsm list                            # List all saved configs with live/drift status
+bsm show <name>                     # Show detailed window layout of a saved config
+bsm delete <name>                   # Delete a saved config (prompts; -f to skip confirmation)
+bsm shutdown [--no-csm] [name|all]  # Shut down a session (default: current when inside tmux,
+                                    # else picker). Use "all" to kill the byobu server.
 ```
 
 ## Multi-session model
 
 `bsm load <name>` creates a tmux session **named `<name>`**. Running `bsm load dev` then `bsm load samdin` from a fresh shell gives you two parallel sessions; switch between them with `tmux switch-client -t <name>` or byobu's `Shift+F8`. The config name and the live tmux session name are coupled by convention — that's how `bsm list` knows which configs are currently loaded.
+
+## csm coupling
+
+When `csm` is installed, bsm and csm are paired by name:
+
+- `bsm load <name>` also runs `csm load <name>` if a csm config `<name>` exists and no csm instance is already running for it.
+- `bsm save <name>` also runs `csm save <name>` if a csm instance for `<name>` is running.
+- `bsm shutdown <name>` also runs `csm stop <name>` if a csm instance is running. `bsm shutdown all` runs `csm stop all`.
+
+Pass `--no-csm` to any bsm command to skip the coupling for that call.
 
 ## What gets saved
 
