@@ -42,15 +42,31 @@ Then reload your shell (`source ~/.bashrc`). You'll get:
 ## Commands
 
 ```bash
-bsm save <name>       # Save the current byobu session as <name>
-bsm load <name>       # Kill existing session (with confirmation) and restore <name>
-bsm list              # List all saved session configs
-bsm show <name>       # Show the window layout of a saved config
-bsm shutdown          # Gracefully shut down byobu (offers to save first)
-bsm help              # Show usage
+bsm save [name]          # Save current byobu session as <name>
+                         # (no arg: defaults to the current session name when inside tmux)
+bsm load <name>          # Load a saved config as a tmux session named <name>.
+                         # Runs alongside other live sessions; prompts if <name> already exists.
+bsm list                 # List saved configs with live/drift status
+bsm show <name>          # Show the window layout of a saved config
+bsm delete <name>        # Delete a saved config (use -f to skip confirmation)
+bsm shutdown [name|all]  # Shut down a session (default: current when inside tmux,
+                         # else picker). Use "all" to kill the entire byobu server.
+bsm help                 # Show usage
 ```
 
-`bsm load` and `bsm shutdown` are interactive (they prompt before destructive actions). `save`, `list`, and `show` are non-interactive and safe to script.
+`bsm load` and `bsm shutdown` are interactive (they prompt before destructive actions). `save`, `list`, `show`, and `delete -f` are safe to script.
+
+## Multi-session model
+
+`bsm load <name>` creates a tmux session **named `<name>`** and runs alongside any other live sessions. Switch between them with `tmux switch-client -t <name>` (or byobu's `Shift+F8`).
+
+The config name and live session name are coupled by convention — that's how `bsm list` decides which configs are currently loaded:
+
+- `● live` — a tmux session with this name is running and its window names match the saved config exactly
+- `~ drift` — a session with this name is running but windows have changed since save
+- blank — not loaded
+
+`bsm shutdown` kills a single session by default; pass `all` to kill the whole server.
 
 ## Where configs live
 
