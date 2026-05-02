@@ -35,12 +35,15 @@ usage() {
 bsm — Byobu Session Manager
 
 Usage:
-  bsm save <name>         Save current byobu session as <name>
-  bsm load <name>         Load a saved session config
-  bsm list                List saved session configs
+  bsm save [name]         Save current byobu session as <name>
+                          (no arg: defaults to current session name when inside tmux)
+  bsm load <name>         Load a saved session config as a tmux session named <name>.
+                          Runs alongside other live sessions; prompts on collision.
+  bsm list                List saved configs with live/drift status
   bsm show <name>         Show contents of a saved config
   bsm delete <name>       Delete a saved session config (use -f to skip confirmation)
-  bsm shutdown            Gracefully shutdown current byobu session (offers to save first)
+  bsm shutdown [name|all] Shut down a session (default: current when inside tmux,
+                          else picker). Use "all" to kill the entire byobu server.
   bsm help                Show this help
 
 Configs are stored as JSON in ~/.config/byobu-sessions/
@@ -81,42 +84,113 @@ _get_full_command() {
 
 # ── Save ─────────────────────────────────────────────────────────────────────
 
-cmd_save() {
-    local name="${1:?Usage: bsm save <name>}"
-    _require_byobu
+# Pick a target tmux session for save/shutdown actions.
+# Echoes the chosen session name on stdout, returns 1 on cancel.
+# Args: $1 = action label (e.g. "save", "shutdown") used only in prompts.
+_pick_session() {
+    local action="$1"
+    local sessions=()
+    local s
+    while IFS= read -r s; do
+        [ -z "$s" ] && continue
+        sessions+=("$s")
+    done < <(byobu list-sessions -F '#{session_name}' 2>/dev/null || true)
 
+    if [ "${#sessions[@]}" -eq 0 ]; then
+        echo "Error: No live byobu sessions." >&2
+        return 1
+    fi
+
+    if [ -n "${TMUX:-}" ]; then
+        tmux display-message -p '#S'
+        return 0
+    fi
+
+    if [ "${#sessions[@]}" -eq 1 ]; then
+        echo "${sessions[0]}"
+        return 0
+    fi
+
+    echo "Multiple live sessions:" >&2
+    local i=1
+    for s in "${sessions[@]}"; do
+        echo "  $i) $s" >&2
+        i=$((i + 1))
+    done
+    local pick
+    read -rp "Pick session to ${action} [1-${#sessions[@]}]: " pick
+    if ! [[ "$pick" =~ ^[0-9]+$ ]] || [ "$pick" -lt 1 ] || [ "$pick" -gt "${#sessions[@]}" ]; then
+        echo "Aborted." >&2
+        return 1
+    fi
+    echo "${sessions[$((pick - 1))]}"
+}
+
+# Snapshot a live tmux session to a JSON config.
+# Args: $1 = config name, $2 = live tmux session name.
+_save_session() {
+    local name="$1"
+    local target_session="$2"
     local config_file="$CONFIG_DIR/${name}.json"
-    local session_name
-    session_name=$(byobu list-sessions -F '#{session_name}' | head -1)
-
     local windows_json="[]"
 
     while IFS='|' read -r idx wname wpath _ pane_pid; do
         local cmd
         cmd=$(_get_full_command "$pane_pid")
-
         windows_json=$(echo "$windows_json" | jq \
             --argjson idx "$idx" \
             --arg name "$wname" \
             --arg dir "$wpath" \
             --arg cmd "$cmd" \
             '. + [{index: $idx, name: $name, directory: $dir, command: $cmd}]')
-    done < <(byobu list-panes -s -F '#{window_index}|#{window_name}|#{pane_current_path}|#{pane_current_command}|#{pane_pid}')
+    done < <(byobu list-panes -t "$target_session" -s -F '#{window_index}|#{window_name}|#{pane_current_path}|#{pane_current_command}|#{pane_pid}')
 
     jq -n \
         --arg name "$name" \
         --arg saved_at "$(date -Iseconds)" \
-        --arg session "$session_name" \
+        --arg session "$target_session" \
         --argjson windows "$windows_json" \
         '{name: $name, saved_at: $saved_at, session_name: $session, windows: $windows}' \
         > "$config_file"
 
-    echo "Saved session as '$name' → $config_file"
+    echo "Saved session '$target_session' as '$name' → $config_file"
+}
+
+cmd_save() {
+    local name="${1:-}"
+    _require_byobu
+
+    local target_session
+    if [ -z "$name" ]; then
+        # No name → must be inside tmux; default name = current session name.
+        if [ -z "${TMUX:-}" ]; then
+            echo "Error: No name given and not inside a byobu session." >&2
+            echo "Usage: bsm save <name>" >&2
+            exit 1
+        fi
+        target_session=$(tmux display-message -p '#S')
+        name="$target_session"
+    else
+        target_session=$(_pick_session "save as '$name'") || exit 0
+    fi
+
+    _save_session "$name" "$target_session"
     echo ""
     cmd_show "$name"
 }
 
 # ── Load ─────────────────────────────────────────────────────────────────────
+
+_attach_or_switch() {
+    local session="$1"
+    if [ -n "${TMUX:-}" ]; then
+        echo "Switching client to '$session'..."
+        tmux switch-client -t "$session"
+    else
+        echo "Attaching to '$session'..."
+        byobu attach -t "$session"
+    fi
+}
 
 cmd_load() {
     local name="${1:?Usage: bsm load <name>}"
@@ -127,20 +201,32 @@ cmd_load() {
         exit 1
     fi
 
-    # Check if a byobu session already exists
-    if byobu list-sessions &>/dev/null; then
-        read -rp "A byobu session is already running. Kill it and load '$name'? [y/N] " answer
-        if [[ "$answer" =~ ^[Yy]$ ]]; then
-            byobu kill-server 2>/dev/null || true
-            sleep 1
-        else
-            echo "Aborted."
-            exit 0
-        fi
+    # Config name == tmux session name. Lets us check "is this loaded?" by
+    # session lookup instead of fingerprinting.
+    local session="$name"
+
+    if tmux has-session -t "$session" 2>/dev/null; then
+        echo "Session '$session' is already running."
+        echo "  [a] attach (or switch) to it as-is"
+        echo "  [r] reload (kill and recreate from saved config)"
+        echo "  [c] cancel"
+        local ans
+        read -rp "Choice [a/r/c]: " ans
+        case "$ans" in
+            a|A)
+                _attach_or_switch "$session"
+                return
+                ;;
+            r|R)
+                tmux kill-session -t "$session" 2>/dev/null || true
+                ;;
+            *)
+                echo "Aborted."
+                exit 0
+                ;;
+        esac
     fi
 
-    local session
-    session=$(jq -r '.session_name // "main"' "$config_file")
     local win_count
     win_count=$(jq '.windows | length' "$config_file")
 
@@ -149,7 +235,7 @@ cmd_load() {
         exit 1
     fi
 
-    echo "Loading session '$name' ($win_count windows)..."
+    echo "Loading session '$session' ($win_count windows)..."
 
     # Create session with the first window
     local first_name first_dir first_cmd
@@ -188,11 +274,27 @@ cmd_load() {
     # Select the first window
     byobu select-window -t "${session}:0"
 
-    echo "Session loaded. Attaching..."
-    byobu attach -t "$session"
+    _attach_or_switch "$session"
 }
 
 # ── List ─────────────────────────────────────────────────────────────────────
+
+_render_status_cell() {
+    local status="$1" width="$2" out='' visible=0
+    case "$status" in
+        live)
+            out="${C_GREEN}● live${C_RESET}"
+            visible=6
+            ;;
+        drift)
+            out="${C_YELLOW}~ drift${C_RESET}"
+            visible=7
+            ;;
+    esac
+    local pad=$((width - visible))
+    (( pad > 0 )) && out+="$(printf '%*s' "$pad" '')"
+    printf '%s' "$out"
+}
 
 cmd_list() {
     local configs
@@ -203,18 +305,21 @@ cmd_list() {
         return
     fi
 
-    # Fingerprint the live byobu session by its window names so we can match
-    # it against saved configs. session_name alone is meaningless — byobu
-    # defaults every session to "1".
-    local live_fp=""
+    # Map of live tmux sessions → window-name fingerprint. Lets us flag
+    # configs as `live` (session exists, windows match) or `drift` (session
+    # exists, windows changed since save).
+    declare -A live_fp
     if byobu list-sessions &>/dev/null; then
-        live_fp=$(byobu list-windows -F '#{window_name}' 2>/dev/null \
-            | paste -sd ',' -)
+        local live_s
+        while IFS= read -r live_s; do
+            [ -z "$live_s" ] && continue
+            live_fp["$live_s"]=$(byobu list-windows -t "$live_s" -F '#{window_name}' 2>/dev/null | paste -sd ',' -)
+        done < <(byobu list-sessions -F '#{session_name}' 2>/dev/null)
     fi
 
     # Collect rows and compute column widths dynamically so data never overflows.
     local rows=()
-    local w_name=4 w_date=8 w_status=6
+    local w_name=4 w_date=8 w_status=7
     local f sname saved_at win_summary status saved_fp
     for f in "$CONFIG_DIR"/*.json; do
         [ -f "$f" ] || continue
@@ -223,8 +328,12 @@ cmd_list() {
         win_summary=$(jq -r '[.windows[].name] | join(", ")' "$f")
         saved_fp=$(jq -r '[.windows[].name] | join(",")' "$f")
         status=""
-        if [ -n "$live_fp" ] && [ "$saved_fp" = "$live_fp" ]; then
-            status="active"
+        if [ -n "${live_fp[$sname]+x}" ]; then
+            if [ "${live_fp[$sname]}" = "$saved_fp" ]; then
+                status="live"
+            else
+                status="drift"
+            fi
         fi
         rows+=("${sname}"$'\x1f'"${saved_at}"$'\x1f'"${status}"$'\x1f'"${win_summary}")
         (( ${#sname}    > w_name )) && w_name=${#sname}
@@ -241,14 +350,7 @@ cmd_list() {
     for row in "${rows[@]}"; do
         IFS=$'\x1f' read -r sname saved_at status win_summary <<< "$row"
         local status_cell
-        if [ "$status" = "active" ]; then
-            status_cell="${C_GREEN}● live${C_RESET}"
-            # Pad manually since the color codes throw off %-*s width.
-            local pad=$((w_status - 6))
-            (( pad > 0 )) && status_cell+="$(printf '%*s' "$pad" '')"
-        else
-            status_cell="$(printf '%-*s' "$w_status" '')"
-        fi
+        status_cell=$(_render_status_cell "$status" "$w_status")
         printf "  ${C_BOLD}%-*s${C_RESET}  ${C_DIM}%-*s${C_RESET}  %s  ${C_GREEN}%s${C_RESET}\n" \
             "$w_name" "$sname" "$w_date" "$saved_at" "$status_cell" "$win_summary"
     done
@@ -335,19 +437,86 @@ cmd_delete() {
 cmd_shutdown() {
     _require_byobu
 
-    read -rp "Save current session before shutdown? [Y/n] " save_answer
-    if [[ ! "$save_answer" =~ ^[Nn]$ ]]; then
-        read -rp "Save name: " save_name
-        if [ -n "$save_name" ]; then
-            cmd_save "$save_name"
+    local arg="${1:-}"
+    local sessions=()
+    local s
+    while IFS= read -r s; do
+        [ -z "$s" ] && continue
+        sessions+=("$s")
+    done < <(byobu list-sessions -F '#{session_name}' 2>/dev/null)
+
+    local target=""
+    if [ "$arg" = "all" ] || [ "$arg" = "--all" ]; then
+        target="__all__"
+    elif [ -n "$arg" ]; then
+        target="$arg"
+    elif [ -n "${TMUX:-}" ]; then
+        target=$(tmux display-message -p '#S')
+    elif [ "${#sessions[@]}" -eq 1 ]; then
+        target="${sessions[0]}"
+    else
+        echo "Active sessions:"
+        local i=1
+        for s in "${sessions[@]}"; do
+            echo "  $i) $s"
+            i=$((i + 1))
+        done
+        echo "  $i) all (kill server)"
+        local pick
+        read -rp "Pick session to shutdown [1-$i]: " pick
+        if ! [[ "$pick" =~ ^[0-9]+$ ]] || [ "$pick" -lt 1 ] || [ "$pick" -gt "$i" ]; then
+            echo "Aborted."
+            exit 0
+        fi
+        if [ "$pick" -eq "$i" ]; then
+            target="__all__"
+        else
+            target="${sessions[$((pick - 1))]}"
         fi
     fi
 
-    echo ""
-    read -rp "Shut down all byobu windows? This will kill all running processes. [y/N] " answer
-    if [[ "$answer" =~ ^[Yy]$ ]]; then
-        byobu kill-server
-        echo "Byobu session terminated."
+    if [ "$target" = "__all__" ]; then
+        local save_answer
+        read -rp "Save any sessions before shutdown? [y/N] " save_answer
+        if [[ "$save_answer" =~ ^[Yy]$ ]]; then
+            for s in "${sessions[@]}"; do
+                local save_name
+                read -rp "Save '$s' as (blank to skip): " save_name
+                if [ -n "$save_name" ]; then
+                    _save_session "$save_name" "$s"
+                fi
+            done
+        fi
+        local ans
+        read -rp "Kill ALL byobu sessions? This terminates every running process. [y/N] " ans
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+            byobu kill-server
+            echo "All sessions terminated."
+        else
+            echo "Aborted."
+        fi
+        return
+    fi
+
+    if ! tmux has-session -t "$target" 2>/dev/null; then
+        echo "Error: No live session '$target'." >&2
+        exit 1
+    fi
+
+    local save_answer
+    read -rp "Save '$target' before shutdown? [Y/n] " save_answer
+    if [[ ! "$save_answer" =~ ^[Nn]$ ]]; then
+        local save_name
+        read -rp "Save name [$target]: " save_name
+        save_name="${save_name:-$target}"
+        _save_session "$save_name" "$target"
+    fi
+
+    local ans
+    read -rp "Kill session '$target'? [y/N] " ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        tmux kill-session -t "$target"
+        echo "Session '$target' terminated."
     else
         echo "Aborted."
     fi
